@@ -95,7 +95,7 @@ public abstract class ClusterScenarios : IAsyncLifetime
         return testBroker;
     }
 
-    /// <summary>Ticks the given brokers until the cluster settles.</summary>
+    /// <summary>Ticks the given brokers a few rounds, enough for assignment to propagate.</summary>
     protected static async Task ConvergeAsync(params TestBroker[] brokers)
     {
         for (var round = 0; round < 4; round++)
@@ -103,6 +103,32 @@ public abstract class ClusterScenarios : IAsyncLifetime
             foreach (var broker in brokers)
             {
                 await broker.Cluster.TickAsync();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Ticks until the cluster reaches the expected state, rather than assuming a fixed
+    /// number of rounds is enough.
+    /// </summary>
+    /// <remarks>
+    /// A cluster converges over rounds, and a lease can lapse between two of them when the
+    /// storage emulator is slow — the brokers' clock is ours to control, the service's is
+    /// not. Re-checking after each round is both closer to how the protocol really behaves
+    /// and the difference between a reliable test and an occasional mystery.
+    /// </remarks>
+    protected static async Task ConvergeUntilAsync(Func<bool> settled, params TestBroker[] brokers)
+    {
+        for (var round = 0; round < 12; round++)
+        {
+            foreach (var broker in brokers)
+            {
+                await broker.Cluster.TickAsync();
+            }
+
+            if (settled())
+            {
+                return;
             }
         }
     }
@@ -139,7 +165,7 @@ public abstract class ClusterScenarios : IAsyncLifetime
     {
         var only = AddBroker("node-a");
         var path = await CreateQueueAsync(only, partitionCount: 4);
-        await ConvergeAsync(only);
+        await ConvergeUntilAsync(() => HeldBy(only, path, 4) == 4, only);
 
         for (var partitionId = 0; partitionId < 4; partitionId++)
         {
@@ -155,10 +181,16 @@ public abstract class ClusterScenarios : IAsyncLifetime
         var second = AddBroker("node-b");
         var path = await CreateQueueAsync(first, partitionCount: 8);
 
-        await ConvergeAsync(first, second);
+        // The first broker takes everything before the second is even known to the leader,
+        // so "all partitions held" is not yet the settled state — the split is.
+        await ConvergeUntilAsync(
+            () => HeldBy(first, path, 8) > 0 && HeldBy(second, path, 8) > 0
+                  && HeldBy(first, path, 8) + HeldBy(second, path, 8) == 8,
+            first,
+            second);
 
-        var firstHeld = Enumerable.Range(0, 8).Count(id => first.Cluster.TryGetLease(path.Value, id, out _));
-        var secondHeld = Enumerable.Range(0, 8).Count(id => second.Cluster.TryGetLease(path.Value, id, out _));
+        var firstHeld = HeldBy(first, path, 8);
+        var secondHeld = HeldBy(second, path, 8);
 
         Assert.Equal(8, firstHeld + secondHeld);
         Assert.True(firstHeld > 0, "the first broker should own some partitions");
@@ -172,7 +204,8 @@ public abstract class ClusterScenarios : IAsyncLifetime
         var second = AddBroker("node-b");
         var path = await CreateQueueAsync(first, partitionCount: 8);
 
-        await ConvergeAsync(first, second);
+        await ConvergeUntilAsync(
+            () => HeldBy(first, path, 8) + HeldBy(second, path, 8) == 8, first, second);
 
         for (var partitionId = 0; partitionId < 8; partitionId++)
         {
@@ -320,7 +353,7 @@ public abstract class ClusterScenarios : IAsyncLifetime
         await ConvergeAsync(leaving, staying);
 
         await leaving.Cluster.ReleaseAllAsync();
-        await ConvergeAsync(staying);
+        await ConvergeUntilAsync(() => HeldBy(staying, path, 4) == 4, staying);
 
         // No waiting for leases to lapse: a clean shutdown says so.
         for (var partitionId = 0; partitionId < 4; partitionId++)
@@ -334,16 +367,23 @@ public abstract class ClusterScenarios : IAsyncLifetime
     {
         var first = AddBroker("node-a");
         var path = await CreateQueueAsync(first, partitionCount: 8);
-        await ConvergeAsync(first);
-        Assert.Equal(8, Enumerable.Range(0, 8).Count(id => first.Cluster.TryGetLease(path.Value, id, out _)));
+        await ConvergeUntilAsync(() => HeldBy(first, path, 8) == 8, first);
+        Assert.Equal(8, HeldBy(first, path, 8));
 
         var second = AddBroker("node-b");
-        await ConvergeAsync(first, second);
+        await ConvergeUntilAsync(
+            () => HeldBy(first, path, 8) + HeldBy(second, path, 8) == 8 && HeldBy(second, path, 8) > 0,
+            first,
+            second);
 
-        var firstHeld = Enumerable.Range(0, 8).Count(id => first.Cluster.TryGetLease(path.Value, id, out _));
+        var firstHeld = HeldBy(first, path, 8);
         Assert.True(firstHeld < 8, "the first broker should have given some partitions up");
-        Assert.Equal(8 - firstHeld, Enumerable.Range(0, 8).Count(id => second.Cluster.TryGetLease(path.Value, id, out _)));
+        Assert.Equal(8 - firstHeld, HeldBy(second, path, 8));
     }
+
+    /// <summary>How many of an entity's partitions this broker currently holds.</summary>
+    private static int HeldBy(TestBroker broker, EntityPath path, int partitionCount) =>
+        Enumerable.Range(0, partitionCount).Count(id => broker.Cluster.TryGetLease(path.Value, id, out _));
 
     /// <summary>Finds a partition key that routes to the given partition.</summary>
     private static string KeyForPartition(int partitionId, int partitionCount)

@@ -1,9 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <!-- Wire-format mapping is an implementation detail, but it is worth testing directly:
+         a property arriving as the wrong type changes how subscription filters behave. -->
+    <InternalsVisibleTo Include="DistMq.Client.Tests" />
+  </ItemGroup>
+  <ItemGroup>
     <PackageReference Include="Grpc.Net.Client" />
     <PackageReference Include="Microsoft.Extensions.Hosting" />
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="..\DistMq.Protocol\DistMq.Protocol.csproj" />
+    <ProjectReference Include="..\DistMq.Core\DistMq.Core.csproj" />
   </ItemGroup>
 </Project>
