@@ -1,0 +1,10 @@
+**/bin/
+**/obj/
+tests/
+docs/
+infra/
+.git/
+__blobstorage__/
+__tablestorage__/
+__queuestorage__/
+__azurite_db*.json

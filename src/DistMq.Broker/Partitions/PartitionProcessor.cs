@@ -1,3 +1,4 @@
+using DistMq.Broker.Observability;
 using DistMq.Broker.Storage;
 using DistMq.Core;
 using DistMq.Core.Delivery;
@@ -947,7 +948,13 @@ public sealed class PartitionProcessor
                 // session queue, so the message lock sweep below sees a consistent picture.
                 consumer.State.ExpireSessions(now);
 
-                foreach (var expired in consumer.State.ExpireLocks(now))
+                var expiredLocks = consumer.State.ExpireLocks(now);
+                if (expiredLocks.Count > 0)
+                {
+                    DistMqTelemetry.RecordExpiredLocks(consumer.Descriptor.Path.Value, expiredLocks.Count);
+                }
+
+                foreach (var expired in expiredLocks)
                 {
                     entries.Add(new LogEntry(LogRecordType.Abandon, new AbandonRecord
                     {
@@ -1084,6 +1091,9 @@ public sealed class PartitionProcessor
         }
 
         deadLettered.Add(outcome.Message);
+        DistMqTelemetry.RecordDeadLetter(
+            consumer.Descriptor.Path.Value, DeadLetterReason.MaxDeliveryCountExceeded, 1);
+
         entries.Add(new LogEntry(LogRecordType.DeadLetter, new DeadLetterRecord
         {
             SequenceNumber = sequenceNumber,

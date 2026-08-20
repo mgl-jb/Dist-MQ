@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using DistMq.Broker.Observability;
 using DistMq.Broker.Storage;
 using DistMq.Core.Entities;
 using DistMq.Storage;
@@ -167,6 +168,7 @@ public sealed class ClusterCoordinator(
             // The lease is gone, so this broker has been fenced. Dropping it here is a
             // courtesy: storage would refuse its writes regardless.
             logger?.LogWarning("Lost the lease on partition {Partition}; dropping it.", key);
+            DistMqTelemetry.PartitionsFenced.Add(1, new KeyValuePair<string, object?>("distmq.partition", key));
             _held.TryRemove(key, out _);
         }
     }
@@ -283,6 +285,7 @@ public sealed class ClusterCoordinator(
 
             _held[key] = lease;
             logger?.LogInformation("Acquired partition {Partition}.", key);
+            DistMqTelemetry.PartitionsAcquired.Add(1, new KeyValuePair<string, object?>("distmq.partition", key));
 
             if (PartitionAcquired is not null)
             {

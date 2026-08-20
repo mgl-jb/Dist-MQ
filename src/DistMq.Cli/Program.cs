@@ -4,14 +4,44 @@ using System.Text;
 using DistMq.Client;
 using DistMq.Core;
 
+// System.CommandLine prints unhandled exceptions itself, so guarding has to happen inside
+// each action rather than around Invoke. A broker error is a normal outcome for a command
+// line tool — a wrong queue name should read as one line, not a stack trace.
+static async Task<int> Guarded(Func<Task<int>> body)
+{
+    try
+    {
+        return await body();
+    }
+    catch (DistMqException ex)
+    {
+        Console.Error.WriteLine($"{ex.Code}: {ex.Message}");
+        return 1;
+    }
+    catch (Exception ex)
+    {
+        Console.Error.WriteLine($"error: {ex.Message}");
+        return 1;
+    }
+}
+
+// The broker listens twice: HTTP/1.1 for administration and HTTP/2 for the gRPC data
+// plane, because a cleartext port cannot carry both.
 var endpointOption = new Option<string>("--endpoint", "-e")
 {
-    Description = "Broker endpoint.",
+    Description = "Broker HTTP endpoint, used for administration.",
     DefaultValueFactory = _ => Environment.GetEnvironmentVariable("DISTMQ_ENDPOINT") ?? "http://localhost:5000",
+};
+
+var dataEndpointOption = new Option<string>("--data-endpoint", "-d")
+{
+    Description = "Broker gRPC endpoint, used for sending and receiving.",
+    DefaultValueFactory = _ => Environment.GetEnvironmentVariable("DISTMQ_DATA_ENDPOINT") ?? "http://localhost:5001",
 };
 
 var root = new RootCommand("distmq — command line client for Dist-MQ.");
 root.Options.Add(endpointOption);
+root.Options.Add(dataEndpointOption);
 
 // ---------------------------------------------------------------- queue admin
 
@@ -27,7 +57,7 @@ var queueCreate = new Command("create", "Create a queue.")
     queueName, partitions, lockDuration, maxDelivery, requiresSession, dedupWindow,
 };
 
-queueCreate.SetAction(async (result, cancellationToken) =>
+queueCreate.SetAction((result, cancellationToken) => Guarded(async () =>
 {
     using var admin = new DistMqAdministrationClient(result.GetValue(endpointOption)!);
     var created = await admin.CreateQueueAsync(
@@ -41,10 +71,11 @@ queueCreate.SetAction(async (result, cancellationToken) =>
         cancellationToken);
 
     Console.WriteLine($"created {created.Path} with {created.PartitionCount} partitions");
-});
+    return 0;
+}));
 
 var queueShow = new Command("show", "Show a queue and its live counts.") { queueName };
-queueShow.SetAction(async (result, cancellationToken) =>
+queueShow.SetAction((result, cancellationToken) => Guarded(async () =>
 {
     using var admin = new DistMqAdministrationClient(result.GetValue(endpointOption)!);
     var name = result.GetValue(queueName)!;
@@ -68,15 +99,16 @@ queueShow.SetAction(async (result, cancellationToken) =>
     Console.WriteLine($"  scheduled        {runtime?.ScheduledMessageCount ?? 0}");
     Console.WriteLine($"  dead-lettered    {runtime?.DeadLetterMessageCount ?? 0}");
     return 0;
-});
+}));
 
 var queueDelete = new Command("delete", "Delete a queue.") { queueName };
-queueDelete.SetAction(async (result, cancellationToken) =>
+queueDelete.SetAction((result, cancellationToken) => Guarded(async () =>
 {
     using var admin = new DistMqAdministrationClient(result.GetValue(endpointOption)!);
     var deleted = await admin.DeleteQueueAsync(result.GetValue(queueName)!, cancellationToken);
     Console.WriteLine(deleted ? "deleted" : "not found");
-});
+    return 0;
+}));
 
 var queue = new Command("queue", "Manage queues.") { queueCreate, queueShow, queueDelete };
 
@@ -84,14 +116,15 @@ var queue = new Command("queue", "Manage queues.") { queueCreate, queueShow, que
 
 var topicName = new Argument<string>("name") { Description = "Topic name." };
 var topicCreate = new Command("create", "Create a topic.") { topicName, partitions };
-topicCreate.SetAction(async (result, cancellationToken) =>
+topicCreate.SetAction((result, cancellationToken) => Guarded(async () =>
 {
     using var admin = new DistMqAdministrationClient(result.GetValue(endpointOption)!);
     var created = await admin.CreateTopicAsync(
         result.GetValue(topicName)!, new TopicOptions(result.GetValue(partitions)), cancellationToken);
 
     Console.WriteLine($"created {created.Path} with {created.PartitionCount} partitions");
-});
+    return 0;
+}));
 
 var subscriptionTopic = new Argument<string>("topic") { Description = "Topic name." };
 var subscriptionName = new Argument<string>("name") { Description = "Subscription name." };
@@ -103,7 +136,7 @@ var subscriptionCreate = new Command("create", "Create a subscription.")
     subscriptionTopic, subscriptionName, filter, action, maxDelivery, requiresSession,
 };
 
-subscriptionCreate.SetAction(async (result, cancellationToken) =>
+subscriptionCreate.SetAction((result, cancellationToken) => Guarded(async () =>
 {
     using var admin = new DistMqAdministrationClient(result.GetValue(endpointOption)!);
     var expression = result.GetValue(filter);
@@ -125,20 +158,23 @@ subscriptionCreate.SetAction(async (result, cancellationToken) =>
         cancellationToken);
 
     Console.WriteLine($"created {created.Path}");
-});
+    return 0;
+}));
 
 var topic = new Command("topic", "Manage topics.") { topicCreate };
 var subscription = new Command("subscription", "Manage subscriptions.") { subscriptionCreate };
 
 var list = new Command("list", "List every entity.");
-list.SetAction(async (result, cancellationToken) =>
+list.SetAction((result, cancellationToken) => Guarded(async () =>
 {
     using var admin = new DistMqAdministrationClient(result.GetValue(endpointOption)!);
     foreach (var entity in await admin.ListEntitiesAsync(cancellationToken))
     {
         Console.WriteLine($"{entity.Kind,-13} {entity.Path,-60} partitions={entity.PartitionCount}");
     }
-});
+
+    return 0;
+}));
 
 // ----------------------------------------------------------------- data plane
 
@@ -162,9 +198,9 @@ var send = new Command("send", "Send messages.")
     entityArgument, bodyOption, countOption, sessionOption, keyOption, propertyOption,
 };
 
-send.SetAction(async (result, cancellationToken) =>
+send.SetAction((result, cancellationToken) => Guarded(async () =>
 {
-    await using var client = new DistMqClient(result.GetValue(endpointOption)!);
+    await using var client = new DistMqClient(result.GetValue(dataEndpointOption)!);
     var sender = client.CreateSender(result.GetValue(entityArgument)!);
     var count = result.GetValue(countOption);
     var body = result.GetValue(bodyOption)!;
@@ -191,7 +227,8 @@ send.SetAction(async (result, cancellationToken) =>
 
     var sequenceNumbers = await sender.SendAsync(messages, cancellationToken);
     Console.WriteLine($"sent {sequenceNumbers.Count} message(s); first sequence number {sequenceNumbers[0]}");
-});
+    return 0;
+}));
 
 var settleOption = new Option<string>("--settle")
 {
@@ -210,9 +247,9 @@ var receive = new Command("receive", "Receive messages.")
     entityArgument, countOption, settleOption, waitOption,
 };
 
-receive.SetAction(async (result, cancellationToken) =>
+receive.SetAction((result, cancellationToken) => Guarded(async () =>
 {
-    await using var client = new DistMqClient(result.GetValue(endpointOption)!);
+    await using var client = new DistMqClient(result.GetValue(dataEndpointOption)!);
     var receiver = client.CreateReceiver(result.GetValue(entityArgument)!);
 
     var messages = await receiver.ReceiveAsync(
@@ -223,7 +260,7 @@ receive.SetAction(async (result, cancellationToken) =>
     if (messages.Count == 0)
     {
         Console.WriteLine("no messages");
-        return;
+        return 0;
     }
 
     foreach (var message in messages)
@@ -243,12 +280,14 @@ receive.SetAction(async (result, cancellationToken) =>
                 break;
         }
     }
-});
+
+    return 0;
+}));
 
 var peek = new Command("peek", "Read messages without locking them.") { entityArgument, countOption };
-peek.SetAction(async (result, cancellationToken) =>
+peek.SetAction((result, cancellationToken) => Guarded(async () =>
 {
-    await using var client = new DistMqClient(result.GetValue(endpointOption)!);
+    await using var client = new DistMqClient(result.GetValue(dataEndpointOption)!);
     var messages = await client.CreateReceiver(result.GetValue(entityArgument)!)
         .PeekAsync(0, result.GetValue(countOption), cancellationToken);
 
@@ -261,7 +300,9 @@ peek.SetAction(async (result, cancellationToken) =>
     {
         Console.WriteLine("no messages");
     }
-});
+
+    return 0;
+}));
 
 // --------------------------------------------------------------- load testing
 
@@ -278,9 +319,9 @@ var load = new Command("load", "Send and receive messages, reporting throughput 
     entityArgument, countOption, sizeOption, batchOption, concurrencyOption,
 };
 
-load.SetAction(async (result, cancellationToken) =>
+load.SetAction((result, cancellationToken) => Guarded(async () =>
 {
-    await using var client = new DistMqClient(result.GetValue(endpointOption)!);
+    await using var client = new DistMqClient(result.GetValue(dataEndpointOption)!);
     var entity = result.GetValue(entityArgument)!;
     var total = result.GetValue(countOption);
     var batchSize = result.GetValue(batchOption);
@@ -338,7 +379,8 @@ load.SetAction(async (result, cancellationToken) =>
 
     receiveClock.Stop();
     Report("receive", received, receiveClock.Elapsed, receiveLatencies);
-});
+    return 0;
+}));
 
 static void Report(string label, int count, TimeSpan elapsed, IReadOnlyCollection<double> latencies)
 {
@@ -369,13 +411,4 @@ root.Subcommands.Add(receive);
 root.Subcommands.Add(peek);
 root.Subcommands.Add(load);
 
-try
-{
-    return await root.Parse(args).InvokeAsync();
-}
-catch (DistMqException ex)
-{
-    // The broker's error code is more useful to a human than a stack trace.
-    Console.Error.WriteLine($"{ex.Code}: {ex.Message}");
-    return 1;
-}
+return await root.Parse(args).InvokeAsync();

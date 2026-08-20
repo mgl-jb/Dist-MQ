@@ -1,3 +1,5 @@
+using System.Diagnostics;
+using DistMq.Broker.Observability;
 using DistMq.Broker.Partitions;
 using DistMq.Broker.Storage;
 using DistMq.Core;
@@ -145,6 +147,9 @@ public sealed class BrokerService(
             }
         }
 
+        using var activity = DistMqTelemetry.StartActivity("distmq.send", path.Value);
+        var clock = Stopwatch.StartNew();
+
         var now = _time.GetUtcNow();
         var alreadySeen = new Dictionary<int, ulong>();
 
@@ -208,6 +213,9 @@ public sealed class BrokerService(
             sequenceNumbers[index] = sequenceNumber;
         }
 
+        DistMqTelemetry.RecordSend(path.Value, messages.Count - alreadySeen.Count, clock.Elapsed.TotalMilliseconds);
+        activity?.SetTag("distmq.message_count", messages.Count);
+
         if (deduplication is not null && descriptor.DuplicateDetectionEnabled)
         {
             // Written after the append, never before. Reserving the id first would turn a
@@ -235,6 +243,9 @@ public sealed class BrokerService(
         TimeSpan maxWait,
         CancellationToken cancellationToken = default)
     {
+        using var activity = DistMqTelemetry.StartActivity("distmq.receive", path.Value);
+        var clock = Stopwatch.StartNew();
+
         var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
         var received = new List<ReceivedMessage>(maxMessages);
         var deadline = DateTimeOffset.UtcNow + maxWait;
@@ -266,6 +277,8 @@ public sealed class BrokerService(
 
             if (received.Count > 0 || DateTimeOffset.UtcNow >= deadline)
             {
+                DistMqTelemetry.RecordReceive(path.Value, received.Count, clock.Elapsed.TotalMilliseconds);
+                activity?.SetTag("distmq.message_count", received.Count);
                 return received;
             }
 
@@ -281,6 +294,9 @@ public sealed class BrokerService(
         IReadOnlyList<Settlement> settlements,
         CancellationToken cancellationToken = default)
     {
+        using var activity = DistMqTelemetry.StartActivity("distmq.settle", path.Value);
+        activity?.SetTag("distmq.settle_action", action.ToString());
+
         var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
         var results = new List<SettlementResult>(settlements.Count);
 
@@ -292,6 +308,7 @@ public sealed class BrokerService(
             results.AddRange(await processor.SettleAsync(consumer, action, group.ToList(), cancellationToken));
         }
 
+        DistMqTelemetry.RecordSettlement(path.Value, action.ToString(), results.Count(result => result.Settled));
         return results;
     }
 

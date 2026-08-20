@@ -24,8 +24,12 @@ suite green and lands its own documentation.
   lease fencing, redirect-on-not-owner, rebalance; failover and fencing tests.
 - [x] **10. Client SDK, CLI, WebSocket bridge** — sender/receiver/processor,
   session receiver, admin client, retries, redirect-following.
-- [ ] **11. Observability and infra** — OpenTelemetry, health endpoints,
+- [x] **11. Observability and infra** — OpenTelemetry, health endpoints,
   Dockerfile, Bicep, `deploy.sh`, operations guide.
+
+Every step has landed. The measured throughput in the README came from the
+`distmq load` generator against Azurite; the Bicep template compiles but has not
+been deployed to a live subscription from this repository.
 
 ## Explicit non-goals
 
