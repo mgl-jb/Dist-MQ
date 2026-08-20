@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+package distmq.v1;
+
+option csharp_namespace = "DistMq.Protocol";
+
+// A property value on a message. Mirrors the value types the SQL filter
+// language can evaluate.
+message PropertyValue {
+  oneof kind {
+    string string_value = 1;
+    int64 int_value = 2;
+    double double_value = 3;
+    bool bool_value = 4;
+    int64 datetime_ticks = 5;
+    bytes bytes_value = 6;
+    bool null_value = 7;
+  }
+}
+
+// A message as it is stored in the log. Either `body` is inline or
+// `payload_pointer` names a claim-check blob (ADR 0009), never both.
+message MessageEnvelope {
+  string message_id = 1;
+  bytes body = 2;
+  string payload_pointer = 3;
+  int32 payload_length = 4;
+
+  string session_id = 10;
+  string partition_key = 11;
+  string correlation_id = 12;
+  string subject = 13;
+  string to = 14;
+  string reply_to = 15;
+  string reply_to_session_id = 16;
+  string content_type = 17;
+
+  int64 enqueued_time_ticks = 20;
+  int64 time_to_live_ticks = 21;
+  int64 scheduled_enqueue_time_ticks = 22;
+
+  map<string, PropertyValue> properties = 30;
+
+  // Set when the message was moved to a dead-letter queue.
+  string dead_letter_reason = 40;
+  string dead_letter_description = 41;
+  string dead_letter_source = 42;
+}

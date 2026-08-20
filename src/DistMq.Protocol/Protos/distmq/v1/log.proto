@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package distmq.v1;
+
+import "distmq/v1/messages.proto";
+
+option csharp_namespace = "DistMq.Protocol";
+
+// Log record types. The value is written as the framing type byte, so each
+// value is permanent: changing one reinterprets existing logs.
+enum LogRecordType {
+  LOG_RECORD_TYPE_UNSPECIFIED = 0;
+  LOG_RECORD_TYPE_APPEND = 1;
+  LOG_RECORD_TYPE_LOCK = 2;
+  LOG_RECORD_TYPE_COMPLETE = 3;
+  LOG_RECORD_TYPE_ABANDON = 4;
+  LOG_RECORD_TYPE_DEFER = 5;
+  LOG_RECORD_TYPE_DEAD_LETTER = 6;
+  LOG_RECORD_TYPE_EXPIRE = 7;
+  LOG_RECORD_TYPE_SESSION_STATE = 8;
+  LOG_RECORD_TYPE_CHECKPOINT = 9;
+}
+
+// A message entered the entity and was assigned a sequence number.
+message AppendRecord {
+  uint64 sequence_number = 1;
+  MessageEnvelope message = 2;
+}
+
+// A message was handed to a receiver. `consumer` is empty for a queue and the
+// subscription name for a topic subscription.
+message LockRecord {
+  uint64 sequence_number = 1;
+  string consumer = 2;
+  string lock_token = 3;
+  int64 locked_until_ticks = 4;
+  uint32 delivery_count = 5;
+  string receiver_id = 6;
+}
+
+message CompleteRecord {
+  uint64 sequence_number = 1;
+  string consumer = 2;
+  string lock_token = 3;
+}
+
+message AbandonRecord {
+  uint64 sequence_number = 1;
+  string consumer = 2;
+  string lock_token = 3;
+  uint32 delivery_count = 4;
+  map<string, PropertyValue> modified_properties = 5;
+}
+
+message DeferRecord {
+  uint64 sequence_number = 1;
+  string consumer = 2;
+  string lock_token = 3;
+}
+
+message DeadLetterRecord {
+  uint64 sequence_number = 1;
+  string consumer = 2;
+  string lock_token = 3;
+  string reason = 4;
+  string description = 5;
+}
+
+message ExpireRecord {
+  uint64 sequence_number = 1;
+  string consumer = 2;
+}
+
+message SessionStateRecord {
+  string session_id = 1;
+  string consumer = 2;
+  string state_pointer = 3;
+  int64 written_ticks = 4;
+}
+
+// A settled range above the frontier.
+message GapRange {
+  uint64 from_inclusive = 1;
+  uint64 to_inclusive = 2;
+}
+
+// Written to the log immediately before a snapshot blob, so replay can
+// recognise that state up to this point is captured elsewhere.
+message CheckpointRecord {
+  string consumer = 1;
+  uint64 frontier = 2;
+  repeated GapRange gaps = 3;
+  int64 written_ticks = 4;
+}

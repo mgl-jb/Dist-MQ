@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package distmq.v1;
+
+import "distmq/v1/log.proto";
+
+option csharp_namespace = "DistMq.Protocol";
+
+message DeferredEntry {
+  uint64 sequence_number = 1;
+  uint64 log_offset = 2;
+  uint32 segment_index = 3;
+}
+
+// Per-consumer delivery progress. A queue has a single consumer keyed by the
+// empty string; a topic has one entry per subscription.
+message ConsumerSnapshot {
+  string consumer = 1;
+  uint64 frontier = 2;
+  repeated GapRange gaps = 3;
+  repeated DeferredEntry deferred = 4;
+  map<uint64, uint32> delivery_counts = 5;
+  map<string, uint64> session_cursors = 6;
+}
+
+// Compacted partition state. Recovery loads the newest snapshot and replays
+// the log from `log_offset`.
+message PartitionSnapshot {
+  string entity = 1;
+  int32 partition_id = 2;
+  uint32 segment_index = 3;
+  uint64 log_offset = 4;
+  uint64 next_sequence_number = 5;
+  repeated ConsumerSnapshot consumers = 6;
+  int64 written_ticks = 7;
+}

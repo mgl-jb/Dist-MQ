@@ -25,7 +25,7 @@ Records are length-prefixed and checksummed:
  offset  size  field
  ------  ----  --------------------------------------------------
       0     4  bodyLength   (uint32, little-endian)
-      4     4  crc32c       (uint32, over recordType || body)
+      4     4  crc32       (uint32, over recordType || body)
       8     1  recordType   (byte)
       9     n  body         (protobuf, DistMq.Protocol.LogRecord)
 ```

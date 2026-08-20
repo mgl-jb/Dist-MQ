@@ -5,7 +5,7 @@ suite green and lands its own documentation.
 
 - [x] **1. Scaffold and design docs** — solution, central package management, CI,
   `docs/architecture.md`, `docs/storage-layout.md`, ADRs 0001–0012.
-- [ ] **2. Core domain** — message model, record framing/CRC codec, sequence
+- [x] **2. Core domain** — message model, record framing/CRC codec, sequence
   numbers, partition hashing, delivery state machine, frontier + gap set.
 - [ ] **3. Storage abstractions + in-memory store** — `IObjectStore`,
   `ITableStore`, `ILeaseProvider`, and the conformance suite both

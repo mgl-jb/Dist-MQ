@@ -118,7 +118,7 @@ A log segment is an append blob holding framed records:
 +--------+--------+---------+------------------+
 ```
 
-`len` is the body length, `crc` is CRC-32C over type+body. A torn or truncated
+`len` is the body length, `crc` is CRC-32 (IEEE) over type+body. A torn or truncated
 tail record is detected and ignored during replay: the log is only ever extended,
 so a partial frame can only be the last one.
 
