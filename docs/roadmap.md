@@ -10,7 +10,7 @@ suite green and lands its own documentation.
 - [x] **3. Storage abstractions + in-memory store** — `IObjectStore`,
   `ITableStore`, `ILeaseProvider`, and the conformance suite both
   implementations must pass.
-- [ ] **4. Azure storage implementation** — append-position CAS, segment
+- [x] **4. Azure storage implementation** — append-position CAS, segment
   rolling, snapshots, blob leases, claim-check payloads; conformance suite
   green against Azurite.
 - [ ] **5. Single-node broker: queues** — gRPC data plane, REST admin,

@@ -101,7 +101,7 @@ public sealed class InMemoryTableStore(TimeProvider? timeProvider = null) : ITab
         IReadOnlyList<TableOperation> operations,
         CancellationToken cancellationToken = default)
     {
-        ValidateTransaction(operations);
+        TableTransactionRules.Validate(operations);
 
         lock (_gate)
         {
@@ -139,43 +139,6 @@ public sealed class InMemoryTableStore(TimeProvider? timeProvider = null) : ITab
         }
 
         return Task.CompletedTask;
-    }
-
-    /// <summary>
-    /// The service rejects a transaction that spans partitions, exceeds 100 operations,
-    /// or touches the same row twice. Enforced here so a batch that would fail in Azure
-    /// fails identically in tests.
-    /// </summary>
-    internal static void ValidateTransaction(IReadOnlyList<TableOperation> operations)
-    {
-        ArgumentNullException.ThrowIfNull(operations);
-
-        if (operations.Count == 0)
-        {
-            throw DistMqException.Invalid("A transaction must contain at least one operation.");
-        }
-
-        if (operations.Count > StorageLimits.MaxTransactionOperations)
-        {
-            throw DistMqException.Invalid(
-                $"A transaction may contain at most {StorageLimits.MaxTransactionOperations} operations.");
-        }
-
-        var partitionKey = operations[0].Entity.PartitionKey;
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var operation in operations)
-        {
-            if (operation.Entity.PartitionKey != partitionKey)
-            {
-                throw DistMqException.Invalid("All entities in a transaction must share a partition key.");
-            }
-
-            if (!seen.Add(operation.Entity.RowKey))
-            {
-                throw DistMqException.Invalid(
-                    $"Row key '{operation.Entity.RowKey}' appears more than once in the transaction.");
-            }
-        }
     }
 
     private static bool InRange(string rowKey, RowKeyRange range) =>
