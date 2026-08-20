@@ -158,6 +158,123 @@ public sealed class MessagingGrpcService(BrokerService broker) : Messaging.Messa
         }
     }
 
+    public override async Task<AcceptSessionResponse> AcceptSession(
+        AcceptSessionRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var accepted = await broker.AcceptSessionAsync(
+                ParsePath(request.Entity),
+                string.IsNullOrEmpty(request.SessionId) ? null : request.SessionId,
+                string.IsNullOrEmpty(request.ReceiverId) ? context.Peer : request.ReceiverId,
+                context.CancellationToken);
+
+            return accepted is null
+                ? new AcceptSessionResponse { Accepted = false }
+                : new AcceptSessionResponse
+                {
+                    Accepted = true,
+                    SessionId = accepted.SessionId,
+                    SessionLockToken = accepted.LockToken,
+                    LockedUntilTicks = accepted.LockedUntil.UtcTicks,
+                };
+        }
+        catch (DistMqException ex)
+        {
+            throw ToRpc(ex);
+        }
+    }
+
+    public override async Task<ReceiveResponse> ReceiveSession(
+        ReceiveSessionRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var messages = await broker.ReceiveForSessionAsync(
+                ParsePath(request.Entity),
+                request.SessionId,
+                request.SessionLockToken,
+                string.IsNullOrEmpty(request.ReceiverId) ? context.Peer : request.ReceiverId,
+                context.CancellationToken);
+
+            var response = new ReceiveResponse();
+            response.Messages.AddRange(messages);
+            return response;
+        }
+        catch (DistMqException ex)
+        {
+            throw ToRpc(ex);
+        }
+    }
+
+    public override async Task<RenewSessionLockResponse> RenewSessionLock(
+        RenewSessionLockRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var lockedUntil = await broker.RenewSessionLockAsync(
+                ParsePath(request.Entity), request.SessionId, request.SessionLockToken, context.CancellationToken);
+
+            return new RenewSessionLockResponse { LockedUntilTicks = lockedUntil.UtcTicks };
+        }
+        catch (DistMqException ex)
+        {
+            throw ToRpc(ex);
+        }
+    }
+
+    public override async Task<ReleaseSessionResponse> ReleaseSession(
+        ReleaseSessionRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var released = await broker.ReleaseSessionAsync(
+                ParsePath(request.Entity), request.SessionId, request.SessionLockToken, context.CancellationToken);
+
+            return new ReleaseSessionResponse { Released = released };
+        }
+        catch (DistMqException ex)
+        {
+            throw ToRpc(ex);
+        }
+    }
+
+    public override async Task<SessionStateResponse> GetSessionState(
+        SessionStateRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var state = await broker.GetSessionStateAsync(
+                ParsePath(request.Entity), request.SessionId, request.SessionLockToken, context.CancellationToken);
+
+            return new SessionStateResponse { State = Google.Protobuf.ByteString.CopyFrom(state) };
+        }
+        catch (DistMqException ex)
+        {
+            throw ToRpc(ex);
+        }
+    }
+
+    public override async Task<SessionStateResponse> SetSessionState(
+        SessionStateRequest request, ServerCallContext context)
+    {
+        try
+        {
+            await broker.SetSessionStateAsync(
+                ParsePath(request.Entity),
+                request.SessionId,
+                request.SessionLockToken,
+                request.State.ToByteArray(),
+                context.CancellationToken);
+
+            return new SessionStateResponse { State = request.State };
+        }
+        catch (DistMqException ex)
+        {
+            throw ToRpc(ex);
+        }
+    }
+
     private static EntityPath ParsePath(string entity)
     {
         if (!EntityPath.TryParse(entity, out var path))

@@ -26,6 +26,7 @@ public sealed class PartitionConsumerState
     private readonly Dictionary<ulong, TrackedMessage> _tracked = [];
     private readonly SortedSet<ulong> _available = [];
     private readonly Dictionary<ulong, TrackedMessage> _deferred = [];
+    private readonly Dictionary<string, SessionEntry> _sessions = new(StringComparer.Ordinal);
     private readonly CompletionFrontier _settled;
 
     public PartitionConsumerState(EntityDescriptor entity, string consumer = "", ulong frontier = 0, int capacity = 10_000)
@@ -61,7 +62,9 @@ public sealed class PartitionConsumerState
 
     public int TrackedCount => _tracked.Count;
 
-    public int AvailableCount => _available.Count;
+    public int AvailableCount => Entity.RequiresSession
+        ? _sessions.Values.Sum(session => session.Queue.Count)
+        : _available.Count;
 
     public int LockedCount => _tracked.Count - _available.Count;
 
@@ -101,7 +104,8 @@ public sealed class PartitionConsumerState
             Envelope = envelope,
             ExpiresAt = Add(enqueued, ttl),
         };
-        _available.Add(sequenceNumber);
+
+        MakeAvailable(sequenceNumber, envelope.SessionId);
         return true;
     }
 
@@ -109,6 +113,14 @@ public sealed class PartitionConsumerState
     public bool TryLock(DateTimeOffset now, string receiverId, out LockedMessage locked)
     {
         locked = null!;
+
+        if (Entity.RequiresSession)
+        {
+            throw new DistMqException(
+                DistMqErrorCode.SessionRequirementMismatch,
+                $"'{Entity.Path.Value}' requires a session; accept a session before receiving.");
+        }
+
         if (_available.Count == 0)
         {
             return false;
@@ -121,6 +133,134 @@ public sealed class PartitionConsumerState
         locked = Lock(message, now, receiverId);
         return true;
     }
+
+    /// <summary>
+    /// Takes a session lock. With no session id, takes any session that has messages
+    /// waiting and no current holder.
+    /// </summary>
+    public bool TryAcceptSession(string? sessionId, DateTimeOffset now, string receiverId, out SessionLock accepted)
+    {
+        accepted = null!;
+
+        if (!Entity.RequiresSession)
+        {
+            throw new DistMqException(
+                DistMqErrorCode.SessionRequirementMismatch,
+                $"'{Entity.Path.Value}' is not a session-enabled entity.");
+        }
+
+        if (sessionId is { Length: > 0 })
+        {
+            if (!_sessions.TryGetValue(sessionId, out var requested))
+            {
+                // Accepting a session that has no messages yet is legitimate: a receiver
+                // may want to hold it open and wait, or read its state.
+                requested = new SessionEntry();
+                _sessions[sessionId] = requested;
+            }
+
+            if (requested.IsLocked(now))
+            {
+                return false;
+            }
+
+            accepted = Grant(sessionId, requested, now, receiverId);
+            return true;
+        }
+
+        foreach (var (candidateId, candidate) in _sessions)
+        {
+            if (candidate.IsLocked(now) || candidate.Queue.Count == 0)
+            {
+                continue;
+            }
+
+            accepted = Grant(candidateId, candidate, now, receiverId);
+            return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Hands over the session's next message, but only when the previous one has been
+    /// settled. One outstanding message at a time is what keeps the order promise true
+    /// even when a message is abandoned.
+    /// </summary>
+    public bool TryLockForSession(
+        string sessionId,
+        string sessionLockToken,
+        DateTimeOffset now,
+        string receiverId,
+        out LockedMessage locked)
+    {
+        locked = null!;
+
+        var session = RequireSession(sessionId, sessionLockToken, now);
+        if (session.Outstanding is not null || session.Queue.Count == 0)
+        {
+            return false;
+        }
+
+        var sequenceNumber = session.Queue.Min;
+        session.Queue.Remove(sequenceNumber);
+        session.Outstanding = sequenceNumber;
+
+        locked = Lock(_tracked[sequenceNumber], now, receiverId);
+        return true;
+    }
+
+    public DateTimeOffset RenewSessionLock(string sessionId, string sessionLockToken, DateTimeOffset now)
+    {
+        var session = RequireSession(sessionId, sessionLockToken, now);
+        session.LockedUntil = Add(now, Entity.LockDuration);
+        return session.LockedUntil;
+    }
+
+    /// <summary>Gives up the session so another receiver can take it.</summary>
+    public bool ReleaseSession(string sessionId, string sessionLockToken, DateTimeOffset now)
+    {
+        if (!_sessions.TryGetValue(sessionId, out var session)
+            || session.LockToken != sessionLockToken
+            || !session.IsLocked(now))
+        {
+            return false;
+        }
+
+        ReturnOutstanding(session);
+        session.Release();
+        return true;
+    }
+
+    /// <summary>
+    /// Releases session locks that lapsed. The session's unsettled message goes back to the
+    /// front of its queue, so the next receiver resumes exactly where the last one stopped.
+    /// </summary>
+    public IReadOnlyList<ExpiredSession> ExpireSessions(DateTimeOffset now)
+    {
+        List<ExpiredSession>? expired = null;
+
+        foreach (var (sessionId, session) in _sessions)
+        {
+            if (session.LockToken is null || session.LockedUntil > now)
+            {
+                continue;
+            }
+
+            var outstanding = session.Outstanding;
+            ReturnOutstanding(session);
+            session.Release();
+            (expired ??= []).Add(new ExpiredSession(sessionId, outstanding));
+        }
+
+        return (IReadOnlyList<ExpiredSession>?)expired ?? [];
+    }
+
+    /// <summary>Sessions that currently have messages waiting.</summary>
+    public IReadOnlyCollection<string> ActiveSessions =>
+        _sessions.Where(pair => pair.Value.Queue.Count > 0 || pair.Value.Outstanding is not null)
+            .Select(pair => pair.Key)
+            .ToList();
 
     /// <summary>Extends a lock the receiver still holds.</summary>
     public DateTimeOffset RenewLock(ulong sequenceNumber, string lockToken, DateTimeOffset now)
@@ -433,6 +573,10 @@ public sealed class PartitionConsumerState
         {
             _tracked.Remove(tracked);
             _available.Remove(tracked);
+            foreach (var session in _sessions.Values)
+            {
+                session.Queue.Remove(tracked);
+            }
         }
 
         foreach (var deferred in _deferred.Keys.Where(key => key < sequenceNumber).ToList())
@@ -474,6 +618,82 @@ public sealed class PartitionConsumerState
         };
     }
 
+    /// <summary>Puts a message where receivers will find it: its session's queue, or the shared set.</summary>
+    private void MakeAvailable(ulong sequenceNumber, string sessionId)
+    {
+        if (!Entity.RequiresSession || string.IsNullOrEmpty(sessionId))
+        {
+            _available.Add(sequenceNumber);
+            return;
+        }
+
+        if (!_sessions.TryGetValue(sessionId, out var session))
+        {
+            session = new SessionEntry();
+            _sessions[sessionId] = session;
+        }
+
+        session.Queue.Add(sequenceNumber);
+    }
+
+    private SessionEntry RequireSession(string sessionId, string sessionLockToken, DateTimeOffset now)
+    {
+        if (!_sessions.TryGetValue(sessionId, out var session) || session.LockToken != sessionLockToken)
+        {
+            throw new DistMqException(
+                DistMqErrorCode.SessionLockLost, $"The lock on session '{sessionId}' is not held by this receiver.");
+        }
+
+        if (!session.IsLocked(now))
+        {
+            throw new DistMqException(
+                DistMqErrorCode.SessionLockLost, $"The lock on session '{sessionId}' has expired.");
+        }
+
+        return session;
+    }
+
+    private SessionLock Grant(string sessionId, SessionEntry session, DateTimeOffset now, string receiverId)
+    {
+        session.LockToken = Guid.NewGuid().ToString("N");
+        session.LockedUntil = Add(now, Entity.LockDuration);
+        session.ReceiverId = receiverId;
+        return new SessionLock(sessionId, session.LockToken, session.LockedUntil, receiverId);
+    }
+
+    /// <summary>Puts an unsettled message back at the front of its session's queue.</summary>
+    private void ReturnOutstanding(SessionEntry session)
+    {
+        if (session.Outstanding is not { } sequenceNumber)
+        {
+            return;
+        }
+
+        if (_tracked.TryGetValue(sequenceNumber, out var message))
+        {
+            message.State = MessageState.Available;
+            message.LockToken = null;
+            message.LockedUntil = default;
+            message.ReceiverId = null;
+            session.Queue.Add(sequenceNumber);
+        }
+
+        session.Outstanding = null;
+    }
+
+    /// <summary>Clears a session's outstanding slot once its message is settled or released.</summary>
+    private void ClearOutstanding(ulong sequenceNumber)
+    {
+        foreach (var session in _sessions.Values)
+        {
+            if (session.Outstanding == sequenceNumber)
+            {
+                session.Outstanding = null;
+                return;
+            }
+        }
+    }
+
     private LockedMessage Lock(TrackedMessage message, DateTimeOffset now, string receiverId)
     {
         message.State = MessageState.Locked;
@@ -497,10 +717,12 @@ public sealed class PartitionConsumerState
         message.ReceiverId = null;
         message.LockedUntil = default;
 
+        ClearOutstanding(message.SequenceNumber);
+
         var shouldDeadLetter = message.DeliveryCount >= Entity.MaxDeliveryCount;
         if (!shouldDeadLetter)
         {
-            _available.Add(message.SequenceNumber);
+            MakeAvailable(message.SequenceNumber, message.Envelope.SessionId);
         }
 
         return new AbandonOutcome(SettleResult.Ok, message.DeliveryCount, shouldDeadLetter, message.Envelope);
@@ -524,6 +746,18 @@ public sealed class PartitionConsumerState
 
     private void Settle(ulong sequenceNumber)
     {
+        if (_tracked.TryGetValue(sequenceNumber, out var message) && !string.IsNullOrEmpty(message.Envelope.SessionId))
+        {
+            if (_sessions.TryGetValue(message.Envelope.SessionId, out var session))
+            {
+                session.Queue.Remove(sequenceNumber);
+                if (session.Outstanding == sequenceNumber)
+                {
+                    session.Outstanding = null;
+                }
+            }
+        }
+
         _tracked.Remove(sequenceNumber);
         _available.Remove(sequenceNumber);
         _settled.Settle(sequenceNumber);

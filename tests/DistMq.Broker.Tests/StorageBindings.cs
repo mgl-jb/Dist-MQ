@@ -76,3 +76,25 @@ public class AzureScheduleDeferDedupScenarios(AzuriteFixture azurite) : Schedule
             (new AzureObjectStore(options), new AzureTableStore(options)));
     }
 }
+
+/// <summary>Session semantics over the in-memory store.</summary>
+public class InMemorySessionScenarios : SessionScenarios
+{
+    protected override Task<(IObjectStore Objects, ITableStore Tables)> CreateStorageAsync()
+    {
+        var storage = new InMemoryStorage();
+        return Task.FromResult((storage.Objects, storage.Tables));
+    }
+}
+
+/// <summary>The same, over Azurite: session state lives in blob storage.</summary>
+[Collection(AzuriteCollection.Name)]
+public class AzureSessionScenarios(AzuriteFixture azurite) : SessionScenarios
+{
+    protected override Task<(IObjectStore Objects, ITableStore Tables)> CreateStorageAsync()
+    {
+        var options = new AzureStorageOptions { ConnectionString = azurite.ConnectionString };
+        return Task.FromResult<(IObjectStore, ITableStore)>(
+            (new AzureObjectStore(options), new AzureTableStore(options)));
+    }
+}

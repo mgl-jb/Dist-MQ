@@ -326,6 +326,113 @@ public sealed class BrokerService(
         return await scheduled.CancelAsync(path, sequenceNumber, cancellationToken);
     }
 
+    /// <summary>
+    /// Takes a session lock. With no session id, takes any session that has messages
+    /// waiting, trying each partition in turn.
+    /// </summary>
+    public async Task<SessionLock?> AcceptSessionAsync(
+        EntityPath path,
+        string? sessionId,
+        string receiverId,
+        CancellationToken cancellationToken = default)
+    {
+        var descriptor = await entities.RequireAsync(path, cancellationToken);
+        if (!descriptor.RequiresSession)
+        {
+            throw new DistMqException(
+                DistMqErrorCode.SessionRequirementMismatch, $"'{path.Value}' is not session-enabled.");
+        }
+
+        var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
+
+        if (sessionId is { Length: > 0 })
+        {
+            // The session id decides the partition (ADR 0007), so there is exactly one
+            // place to ask.
+            var owner = processors[PartitionRouter.ForKey(sessionId, processors.Length)];
+            return await owner.AcceptSessionAsync(consumer, sessionId, receiverId, cancellationToken);
+        }
+
+        foreach (var processor in processors)
+        {
+            var accepted = await processor.AcceptSessionAsync(consumer, null, receiverId, cancellationToken);
+            if (accepted is not null)
+            {
+                return accepted;
+            }
+        }
+
+        return null;
+    }
+
+    public async Task<IReadOnlyList<ReceivedMessage>> ReceiveForSessionAsync(
+        EntityPath path,
+        string sessionId,
+        string sessionLockToken,
+        string receiverId,
+        CancellationToken cancellationToken = default)
+    {
+        var processor = await SessionOwnerAsync(path, sessionId, cancellationToken);
+        var locked = await processor.Processor.ReceiveForSessionAsync(
+            processor.Consumer, sessionId, sessionLockToken, receiverId, cancellationToken);
+
+        return locked.Select(message => ToReceived(message, processor.Processor.PartitionId)).ToList();
+    }
+
+    public async Task<DateTimeOffset> RenewSessionLockAsync(
+        EntityPath path,
+        string sessionId,
+        string sessionLockToken,
+        CancellationToken cancellationToken = default)
+    {
+        var owner = await SessionOwnerAsync(path, sessionId, cancellationToken);
+        return await owner.Processor.RenewSessionLockAsync(
+            owner.Consumer, sessionId, sessionLockToken, cancellationToken);
+    }
+
+    public async Task<bool> ReleaseSessionAsync(
+        EntityPath path,
+        string sessionId,
+        string sessionLockToken,
+        CancellationToken cancellationToken = default)
+    {
+        var owner = await SessionOwnerAsync(path, sessionId, cancellationToken);
+        return await owner.Processor.ReleaseSessionAsync(
+            owner.Consumer, sessionId, sessionLockToken, cancellationToken);
+    }
+
+    public async Task<byte[]> GetSessionStateAsync(
+        EntityPath path,
+        string sessionId,
+        string sessionLockToken,
+        CancellationToken cancellationToken = default)
+    {
+        var owner = await SessionOwnerAsync(path, sessionId, cancellationToken);
+        return await owner.Processor.GetSessionStateAsync(
+            owner.Consumer, sessionId, sessionLockToken, cancellationToken);
+    }
+
+    public async Task SetSessionStateAsync(
+        EntityPath path,
+        string sessionId,
+        string sessionLockToken,
+        ReadOnlyMemory<byte> state,
+        CancellationToken cancellationToken = default)
+    {
+        var owner = await SessionOwnerAsync(path, sessionId, cancellationToken);
+        await owner.Processor.SetSessionStateAsync(
+            owner.Consumer, sessionId, sessionLockToken, state, cancellationToken);
+    }
+
+    private async Task<(PartitionProcessor Processor, string Consumer)> SessionOwnerAsync(
+        EntityPath path,
+        string sessionId,
+        CancellationToken cancellationToken)
+    {
+        var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
+        return (processors[PartitionRouter.ForKey(sessionId, processors.Length)], consumer);
+    }
+
     /// <summary>Locks previously deferred messages by sequence number.</summary>
     public async Task<IReadOnlyList<ReceivedMessage>> ReceiveDeferredAsync(
         EntityPath path,

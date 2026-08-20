@@ -35,5 +35,18 @@ public readonly record struct ExpiredLock(
     bool ShouldDeadLetter,
     MessageEnvelope Message);
 
+/// <summary>
+/// A held session lock. While it is held, only this receiver is served the session's
+/// messages, and only one at a time.
+/// </summary>
+public sealed record SessionLock(
+    string SessionId,
+    string LockToken,
+    DateTimeOffset LockedUntil,
+    string ReceiverId);
+
+/// <summary>A session lock that lapsed, releasing the session to another receiver.</summary>
+public readonly record struct ExpiredSession(string SessionId, ulong? OutstandingSequenceNumber);
+
 /// <summary>A message whose time-to-live elapsed before it was settled.</summary>
 public readonly record struct ExpiredMessage(ulong SequenceNumber, MessageEnvelope Message);

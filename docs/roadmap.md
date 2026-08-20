@@ -19,7 +19,7 @@ suite green and lands its own documentation.
   and SQL-subset filters, rule actions, rule CRUD.
 - [x] **7. Scheduled, deferred, dedup, batching** — timer worker, deferral index,
   dedup window and sweeper, batched append/settle, credit-based prefetch.
-- [ ] **8. Sessions** — session locks, per-session FIFO, session state.
+- [x] **8. Sessions** — session locks, per-session FIFO, session state.
 - [ ] **9. Clustering** — membership, leader election, rendezvous assignment,
   lease fencing, forwarding, rebalance; failover and fencing tests.
 - [ ] **10. Client SDK, CLI, WebSocket bridge** — sender/receiver/processor,

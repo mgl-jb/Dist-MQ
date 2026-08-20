@@ -673,6 +673,182 @@ public sealed class PartitionProcessor
         }
     }
 
+    /// <summary>
+    /// Takes a session lock, or any free session with messages waiting when no id is given.
+    /// </summary>
+    public async Task<SessionLock?> AcceptSessionAsync(
+        string consumerName,
+        string? sessionId,
+        string receiverId,
+        CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            return Consumer(consumerName).State.TryAcceptSession(
+                sessionId, _time.GetUtcNow(), receiverId, out var accepted)
+                ? accepted
+                : null;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Hands over the session's next message. At most one is outstanding at a time, which
+    /// is what makes the ordering promise survive an abandon.
+    /// </summary>
+    public async Task<IReadOnlyList<LockedMessage>> ReceiveForSessionAsync(
+        string consumerName,
+        string sessionId,
+        string sessionLockToken,
+        string receiverId,
+        CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            var consumer = Consumer(consumerName);
+            var now = _time.GetUtcNow();
+
+            if (!consumer.State.TryLockForSession(sessionId, sessionLockToken, now, receiverId, out var message))
+            {
+                return [];
+            }
+
+            await Log.AppendAsync(
+                [
+                    new LogEntry(LogRecordType.Lock, new LockRecord
+                    {
+                        SequenceNumber = message.SequenceNumber,
+                        Consumer = consumerName,
+                        LockToken = message.LockToken,
+                        LockedUntilTicks = message.LockedUntil.UtcTicks,
+                        DeliveryCount = message.DeliveryCount,
+                        ReceiverId = receiverId,
+                    }),
+                ],
+                cancellationToken);
+
+            _recordsSinceSnapshot++;
+            return [message with { Message = await ResolvePayloadAsync(message.Message, cancellationToken) }];
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<DateTimeOffset> RenewSessionLockAsync(
+        string consumerName,
+        string sessionId,
+        string sessionLockToken,
+        CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            return Consumer(consumerName).State.RenewSessionLock(sessionId, sessionLockToken, _time.GetUtcNow());
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task<bool> ReleaseSessionAsync(
+        string consumerName,
+        string sessionId,
+        string sessionLockToken,
+        CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            return Consumer(consumerName).State.ReleaseSession(sessionId, sessionLockToken, _time.GetUtcNow());
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>Reads the session's stored state. Empty when nothing has been written.</summary>
+    public async Task<byte[]> GetSessionStateAsync(
+        string consumerName,
+        string sessionId,
+        string sessionLockToken,
+        CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            Consumer(consumerName).State.RenewSessionLock(sessionId, sessionLockToken, _time.GetUtcNow());
+        }
+        finally
+        {
+            _gate.Release();
+        }
+
+        try
+        {
+            return await _objects.ReadAsync(
+                StorageNames.SessionContainer, SessionStatePath(consumerName, sessionId), cancellationToken: cancellationToken);
+        }
+        catch (DistMqException ex) when (ex.Code == DistMqErrorCode.EntityNotFound)
+        {
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// Writes the session's state. Only the lock holder may write, so two receivers cannot
+    /// interleave updates to the same session.
+    /// </summary>
+    public async Task SetSessionStateAsync(
+        string consumerName,
+        string sessionId,
+        string sessionLockToken,
+        ReadOnlyMemory<byte> state,
+        CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            Consumer(consumerName).State.RenewSessionLock(sessionId, sessionLockToken, _time.GetUtcNow());
+
+            var path = SessionStatePath(consumerName, sessionId);
+            await _objects.WriteAsync(StorageNames.SessionContainer, path, state, cancellationToken: cancellationToken);
+
+            // Recorded in the log too, so the partition's history explains its state rather
+            // than the blob appearing to change on its own.
+            await Log.AppendAsync(
+                [
+                    new LogEntry(LogRecordType.SessionState, new SessionStateRecord
+                    {
+                        SessionId = sessionId,
+                        Consumer = consumerName,
+                        StatePointer = path,
+                        WrittenTicks = _time.GetUtcNow().UtcTicks,
+                    }),
+                ],
+                cancellationToken);
+
+            _recordsSinceSnapshot++;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private string SessionStatePath(string consumerName, string sessionId) =>
+        StorageNames.SessionStatePath(
+            consumerName.Length == 0 ? _entity.Path.Value : $"{_entity.Path.Value}/{consumerName}",
+            sessionId);
+
     public async Task<DateTimeOffset> RenewLockAsync(
         string consumerName,
         ulong sequenceNumber,
@@ -729,6 +905,10 @@ public sealed class PartitionProcessor
 
             foreach (var consumer in _consumers.Values)
             {
+                // Session locks first: releasing one returns its unsettled message to the
+                // session queue, so the message lock sweep below sees a consistent picture.
+                consumer.State.ExpireSessions(now);
+
                 foreach (var expired in consumer.State.ExpireLocks(now))
                 {
                     entries.Add(new LogEntry(LogRecordType.Abandon, new AbandonRecord

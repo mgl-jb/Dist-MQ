@@ -241,9 +241,19 @@ entire session lives on one broker — ordering needs no cross-node coordination
 - `AcceptSession(sessionId)` or `AcceptNextSession()` takes a **session lock**.
 - While held, that receiver is the only one served messages for the session, and
   **at most one message is outstanding at a time** — strict FIFO.
-- Session state (an opaque blob) is readable and writable by the lock holder.
+- Session state (an opaque blob) is readable and writable by the lock holder
+  only, so two receivers cannot interleave updates to the same session.
 - The session lock renews like a message lock; on expiry the session becomes
-  available to other receivers, starting from the unsettled message.
+  available to other receivers, and its unsettled message returns to the front of
+  the session's queue so the next holder resumes exactly where the last stopped.
+- A session lock does not survive a broker failure, for the same reason a message
+  lock does not: the session is simply available again. Its progress and state do
+  survive, because both are in storage.
+
+The one-outstanding-message rule is what makes the ordering promise hold. Several
+messages in flight would let an abandoned message return to the queue behind one
+already delivered, turning "ordered" into "ordered unless something fails" —
+which is exactly when ordering matters.
 
 ## Scheduling, deferral and deduplication
 

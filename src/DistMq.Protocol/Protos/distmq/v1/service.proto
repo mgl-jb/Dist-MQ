@@ -130,6 +130,58 @@ message ReceiveDeferredResponse {
   repeated ReceivedMessage messages = 1;
 }
 
+message AcceptSessionRequest {
+  string entity = 1;
+  // Empty to accept any session that has messages waiting.
+  string session_id = 2;
+  string receiver_id = 3;
+}
+
+message AcceptSessionResponse {
+  bool accepted = 1;
+  string session_id = 2;
+  string session_lock_token = 3;
+  int64 locked_until_ticks = 4;
+}
+
+message ReceiveSessionRequest {
+  string entity = 1;
+  string session_id = 2;
+  string session_lock_token = 3;
+  string receiver_id = 4;
+}
+
+message RenewSessionLockRequest {
+  string entity = 1;
+  string session_id = 2;
+  string session_lock_token = 3;
+}
+
+message RenewSessionLockResponse {
+  int64 locked_until_ticks = 1;
+}
+
+message ReleaseSessionRequest {
+  string entity = 1;
+  string session_id = 2;
+  string session_lock_token = 3;
+}
+
+message ReleaseSessionResponse {
+  bool released = 1;
+}
+
+message SessionStateRequest {
+  string entity = 1;
+  string session_id = 2;
+  string session_lock_token = 3;
+  bytes state = 4;
+}
+
+message SessionStateResponse {
+  bytes state = 1;
+}
+
 // The data plane. Every method routes to the broker that owns the target
 // partition, forwarding internally when this broker does not own it.
 service Messaging {
@@ -141,4 +193,10 @@ service Messaging {
   rpc ScheduleMessage(ScheduleMessageRequest) returns (ScheduleMessageResponse);
   rpc CancelScheduledMessage(CancelScheduledMessageRequest) returns (CancelScheduledMessageResponse);
   rpc ReceiveDeferred(ReceiveDeferredRequest) returns (ReceiveDeferredResponse);
+  rpc AcceptSession(AcceptSessionRequest) returns (AcceptSessionResponse);
+  rpc ReceiveSession(ReceiveSessionRequest) returns (ReceiveResponse);
+  rpc RenewSessionLock(RenewSessionLockRequest) returns (RenewSessionLockResponse);
+  rpc ReleaseSession(ReleaseSessionRequest) returns (ReleaseSessionResponse);
+  rpc GetSessionState(SessionStateRequest) returns (SessionStateResponse);
+  rpc SetSessionState(SessionStateRequest) returns (SessionStateResponse);
 }

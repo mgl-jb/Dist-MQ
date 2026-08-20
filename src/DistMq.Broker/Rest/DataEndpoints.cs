@@ -30,6 +30,15 @@ public sealed record ReceivedMessageDto(
 /// <summary>Settles a batch in one call: one log append and one table transaction instead of N.</summary>
 public sealed record BatchSettleRequestDto(string Action, List<SettleRequestDto> Settlements);
 
+/// <summary>Request body for accepting a session.</summary>
+public sealed record AcceptSessionRequestDto(string? SessionId = null, string? ReceiverId = null);
+
+/// <summary>A held session lock as it appears over HTTP.</summary>
+public sealed record SessionLockDto(string SessionId, string SessionLockToken, DateTimeOffset LockedUntil);
+
+/// <summary>Request body for session-scoped operations.</summary>
+public sealed record SessionRequestDto(string SessionId, string SessionLockToken, string? ReceiverId = null, string? State = null);
+
 /// <summary>Request body for scheduling a message.</summary>
 public sealed record ScheduleMessageRequestDto(MessageDto Message, DateTimeOffset DueAt);
 
@@ -237,6 +246,87 @@ public static class DataEndpoints
                 settled = result.Settled,
                 error = result.Error,
             }));
+        });
+
+        group.MapPost("/sessions/accept", async (
+            string name,
+            string? subscription,
+            AcceptSessionRequestDto request,
+            BrokerService broker,
+            CancellationToken cancellationToken) =>
+        {
+            var accepted = await broker.AcceptSessionAsync(
+                Resolve(name, subscription), request.SessionId, request.ReceiverId ?? "http", cancellationToken);
+
+            return accepted is null
+                ? Results.NoContent()
+                : Results.Ok(new SessionLockDto(accepted.SessionId, accepted.LockToken, accepted.LockedUntil));
+        });
+
+        group.MapPost("/sessions/receive", async (
+            string name,
+            string? subscription,
+            SessionRequestDto request,
+            BrokerService broker,
+            CancellationToken cancellationToken) =>
+        {
+            var messages = await broker.ReceiveForSessionAsync(
+                Resolve(name, subscription),
+                request.SessionId,
+                request.SessionLockToken,
+                request.ReceiverId ?? "http",
+                cancellationToken);
+
+            return Results.Ok(messages.Select(ToDto));
+        });
+
+        group.MapPost("/sessions/renewlock", async (
+            string name,
+            string? subscription,
+            SessionRequestDto request,
+            BrokerService broker,
+            CancellationToken cancellationToken) =>
+        {
+            var lockedUntil = await broker.RenewSessionLockAsync(
+                Resolve(name, subscription), request.SessionId, request.SessionLockToken, cancellationToken);
+
+            return Results.Ok(new { lockedUntil });
+        });
+
+        group.MapPost("/sessions/release", async (
+            string name,
+            string? subscription,
+            SessionRequestDto request,
+            BrokerService broker,
+            CancellationToken cancellationToken) =>
+            await broker.ReleaseSessionAsync(
+                Resolve(name, subscription), request.SessionId, request.SessionLockToken, cancellationToken)
+                ? Results.NoContent()
+                : Results.Conflict(new { error = "SessionLockLost" }));
+
+        group.MapPost("/sessions/state", async (
+            string name,
+            string? subscription,
+            SessionRequestDto request,
+            BrokerService broker,
+            CancellationToken cancellationToken) =>
+        {
+            if (request.State is null)
+            {
+                var state = await broker.GetSessionStateAsync(
+                    Resolve(name, subscription), request.SessionId, request.SessionLockToken, cancellationToken);
+
+                return Results.Ok(new { state = Convert.ToBase64String(state) });
+            }
+
+            await broker.SetSessionStateAsync(
+                Resolve(name, subscription),
+                request.SessionId,
+                request.SessionLockToken,
+                Convert.FromBase64String(request.State),
+                cancellationToken);
+
+            return Results.NoContent();
         });
 
         group.MapPost("/messages/renewlock", async (
