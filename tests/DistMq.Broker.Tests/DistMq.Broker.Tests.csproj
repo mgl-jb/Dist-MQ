@@ -3,8 +3,14 @@
     <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
   </ItemGroup>
   <ItemGroup>
+    <!-- The Azurite fixture is shared rather than duplicated: one definition of how the
+         emulator is started keeps the two suites honest with each other. -->
+    <Compile Include="..\DistMq.Storage.Tests\AzuriteFixture.cs" Link="AzuriteFixture.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\..\src\DistMq.Broker\DistMq.Broker.csproj" />
     <ProjectReference Include="..\..\src\DistMq.Client\DistMq.Client.csproj" />
     <ProjectReference Include="..\..\src\DistMq.Storage.InMemory\DistMq.Storage.InMemory.csproj" />
+    <ProjectReference Include="..\..\src\DistMq.Storage.Azure\DistMq.Storage.Azure.csproj" />
   </ItemGroup>
 </Project>

@@ -13,7 +13,7 @@ suite green and lands its own documentation.
 - [x] **4. Azure storage implementation** — append-position CAS, segment
   rolling, snapshots, blob leases, claim-check payloads; conformance suite
   green against Azurite.
-- [ ] **5. Single-node broker: queues** — gRPC data plane, REST admin,
+- [x] **5. Single-node broker: queues** — gRPC data plane, REST admin,
   peek-lock, lock expiry sweeper, TTL, DLQ, recovery from snapshot.
 - [ ] **6. Topics, subscriptions, filters** — per-subscription state, correlation
   and SQL-subset filters, rule actions, rule CRUD.

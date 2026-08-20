@@ -1,0 +1,110 @@
+syntax = "proto3";
+
+package distmq.v1;
+
+import "distmq/v1/messages.proto";
+
+option csharp_namespace = "DistMq.Protocol";
+
+// How a receiver takes messages.
+enum ReceiveMode {
+  RECEIVE_MODE_UNSPECIFIED = 0;
+  // The message is locked and must be settled. Redelivered if the lock lapses.
+  RECEIVE_MODE_PEEK_LOCK = 1;
+  // The message is settled as it is delivered. Faster, and lost if the client dies.
+  RECEIVE_MODE_RECEIVE_AND_DELETE = 2;
+}
+
+enum SettleAction {
+  SETTLE_ACTION_UNSPECIFIED = 0;
+  SETTLE_ACTION_COMPLETE = 1;
+  SETTLE_ACTION_ABANDON = 2;
+  SETTLE_ACTION_DEAD_LETTER = 3;
+  SETTLE_ACTION_DEFER = 4;
+}
+
+message SendRequest {
+  string entity = 1;
+  repeated MessageEnvelope messages = 2;
+}
+
+message SendResponse {
+  // Sequence numbers assigned, in the order the messages were supplied.
+  repeated uint64 sequence_numbers = 1;
+}
+
+message ReceiveRequest {
+  string entity = 1;
+  int32 max_messages = 2;
+  ReceiveMode mode = 3;
+  // How long to wait for a message before returning empty.
+  int64 max_wait_ms = 4;
+  string receiver_id = 5;
+}
+
+message ReceivedMessage {
+  uint64 sequence_number = 1;
+  string lock_token = 2;
+  int64 locked_until_ticks = 3;
+  uint32 delivery_count = 4;
+  MessageEnvelope message = 5;
+  int32 partition_id = 6;
+}
+
+message ReceiveResponse {
+  repeated ReceivedMessage messages = 1;
+}
+
+message SettleRequest {
+  string entity = 1;
+  SettleAction action = 2;
+  repeated Settlement settlements = 3;
+}
+
+message Settlement {
+  uint64 sequence_number = 1;
+  string lock_token = 2;
+  string dead_letter_reason = 3;
+  string dead_letter_description = 4;
+  map<string, PropertyValue> modified_properties = 5;
+}
+
+message SettleResponse {
+  repeated SettlementResult results = 1;
+}
+
+message SettlementResult {
+  uint64 sequence_number = 1;
+  bool settled = 2;
+  string error = 3;
+}
+
+message RenewLockRequest {
+  string entity = 1;
+  uint64 sequence_number = 2;
+  string lock_token = 3;
+}
+
+message RenewLockResponse {
+  int64 locked_until_ticks = 1;
+}
+
+message PeekRequest {
+  string entity = 1;
+  uint64 from_sequence_number = 2;
+  int32 max_messages = 3;
+}
+
+message PeekResponse {
+  repeated ReceivedMessage messages = 1;
+}
+
+// The data plane. Every method routes to the broker that owns the target
+// partition, forwarding internally when this broker does not own it.
+service Messaging {
+  rpc Send(SendRequest) returns (SendResponse);
+  rpc Receive(ReceiveRequest) returns (ReceiveResponse);
+  rpc Settle(SettleRequest) returns (SettleResponse);
+  rpc RenewLock(RenewLockRequest) returns (RenewLockResponse);
+  rpc Peek(PeekRequest) returns (PeekResponse);
+}

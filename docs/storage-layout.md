@@ -8,7 +8,7 @@ the authoritative reference for the on-disk (on-blob) formats.
 | Container | Path | Type | Purpose |
 |---|---|---|---|
 | `distmq-log` | `{entity}/{part:D5}/segments/{seg:D10}.log` | Append blob | The partition write-ahead log |
-| `distmq-log` | `{entity}/{part:D5}/snapshots/{offset:D20}.snap` | Block blob | Compacted delivery state |
+| `distmq-log` | `{entity}/{part:D5}/snapshots/{seg:D10}-{offset:D20}.snap` | Block blob | Compacted delivery state |
 | `distmq-ownership` | `{entity}/{part:D5}/owner` | Block blob (0 bytes) | Lease target = partition ownership |
 | `distmq-ownership` | `namespace/coordinator` | Block blob (0 bytes) | Lease target = leader election |
 | `distmq-payloads` | `{yyyy}/{MM}/{dd}/{guid}` | Block blob | Claim-checked bodies > 256 KB |
@@ -74,8 +74,9 @@ lease).
 
 ## Snapshot format
 
-A snapshot is protobuf, written as a block blob named for the log offset it
-covers:
+A snapshot is protobuf, written as a block blob named for the log position it
+covers — segment index first, so lexicographic order is chronological and "the
+newest snapshot" is the last listing entry:
 
 ```
 Snapshot {

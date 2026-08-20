@@ -34,8 +34,13 @@ public static class StorageNames
     public static string SegmentPrefix(string entity, int partitionId) =>
         $"{entity}/{partitionId:D5}/segments/";
 
-    public static string SnapshotPath(string entity, int partitionId, ulong logOffset) =>
-        $"{entity}/{partitionId:D5}/snapshots/{logOffset:D20}.snap";
+    /// <summary>
+    /// Snapshots are named by the log position they cover, segment first, so that
+    /// lexicographic order is chronological order and "the newest snapshot" is just the
+    /// last listing entry.
+    /// </summary>
+    public static string SnapshotPath(string entity, int partitionId, uint segmentIndex, ulong logOffset) =>
+        $"{entity}/{partitionId:D5}/snapshots/{segmentIndex:D10}-{logOffset:D20}.snap";
 
     public static string SnapshotPrefix(string entity, int partitionId) =>
         $"{entity}/{partitionId:D5}/snapshots/";

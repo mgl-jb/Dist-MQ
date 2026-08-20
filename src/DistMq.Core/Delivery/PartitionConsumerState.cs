@@ -347,6 +347,47 @@ public sealed class PartitionConsumerState
         return results;
     }
 
+    /// <summary>
+    /// Marks a sequence number settled during log replay, whatever state it is in. Replay
+    /// applies recorded outcomes rather than re-deciding them.
+    /// </summary>
+    public void MarkSettled(ulong sequenceNumber) => Settle(sequenceNumber);
+
+    /// <summary>
+    /// Carries a delivery count across replay. Locks themselves are deliberately not
+    /// restored — a message locked when the previous owner died is redelivered — but the
+    /// attempts it already used must survive, or a poison message would never reach its
+    /// delivery budget after a failover.
+    /// </summary>
+    public void RestoreDeliveryCount(ulong sequenceNumber, uint deliveryCount)
+    {
+        if (_tracked.TryGetValue(sequenceNumber, out var message))
+        {
+            message.DeliveryCount = Math.Max(message.DeliveryCount, deliveryCount);
+        }
+    }
+
+    /// <summary>Replays a deferral: the message leaves the delivery window but stays addressable.</summary>
+    public void MarkDeferred(ulong sequenceNumber)
+    {
+        if (!_tracked.TryGetValue(sequenceNumber, out var message))
+        {
+            return;
+        }
+
+        message.State = MessageState.Deferred;
+        message.LockToken = null;
+        _deferred[sequenceNumber] = message;
+        Settle(sequenceNumber);
+    }
+
+    /// <summary>Sequence numbers currently deferred, for snapshotting.</summary>
+    public IReadOnlyCollection<ulong> DeferredSequenceNumbers => _deferred.Keys;
+
+    /// <summary>Delivery counts of unsettled messages, for snapshotting.</summary>
+    public IReadOnlyDictionary<ulong, uint> DeliveryCounts =>
+        _tracked.ToDictionary(pair => pair.Key, pair => pair.Value.DeliveryCount);
+
     /// <summary>Restores the cursor from a snapshot before replay resumes.</summary>
     public void RestoreCursor(ulong frontier, IEnumerable<GapRange> gaps)
     {
