@@ -173,6 +173,8 @@ public sealed class BrokerService(
             }
 
             var processor = await partitions.RouteAsync(path, messages[index], cancellationToken);
+            EnsureOwned(path, processor.PartitionId);
+
             if (!byPartition.TryGetValue(processor, out var batch))
             {
                 batch = [];
@@ -246,6 +248,14 @@ public sealed class BrokerService(
                 if (received.Count >= maxMessages)
                 {
                     break;
+                }
+
+                // Partitions owned elsewhere are skipped rather than refused: a receive
+                // should hand back what this broker can serve, and the client's topology
+                // cache takes it to the other owners for the rest.
+                if (!partitions.Owns(path, processor.PartitionId))
+                {
+                    continue;
                 }
 
                 var batch = await processor.ReceiveAsync(
@@ -349,12 +359,17 @@ public sealed class BrokerService(
         {
             // The session id decides the partition (ADR 0007), so there is exactly one
             // place to ask.
-            var owner = processors[PartitionRouter.ForKey(sessionId, processors.Length)];
+            var owner = Partition(processors, path, PartitionRouter.ForKey(sessionId, processors.Length));
             return await owner.AcceptSessionAsync(consumer, sessionId, receiverId, cancellationToken);
         }
 
         foreach (var processor in processors)
         {
+            if (!partitions.Owns(path, processor.PartitionId))
+            {
+                continue;
+            }
+
             var accepted = await processor.AcceptSessionAsync(consumer, null, receiverId, cancellationToken);
             if (accepted is not null)
             {
@@ -430,7 +445,7 @@ public sealed class BrokerService(
         CancellationToken cancellationToken)
     {
         var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
-        return (processors[PartitionRouter.ForKey(sessionId, processors.Length)], consumer);
+        return (Partition(processors, path, PartitionRouter.ForKey(sessionId, processors.Length)), consumer);
     }
 
     /// <summary>Locks previously deferred messages by sequence number.</summary>
@@ -478,7 +493,7 @@ public sealed class BrokerService(
 
         foreach (var processor in processors)
         {
-            if (peeked.Count >= maxMessages)
+            if (peeked.Count >= maxMessages || !partitions.Owns(path, processor.PartitionId))
             {
                 break;
             }
@@ -508,7 +523,11 @@ public sealed class BrokerService(
 
             foreach (var processor in await partitions.GetAsync(path, cancellationToken))
             {
-                await processor.SweepAsync(cancellationToken);
+                // Sweeping writes to the log, so only the owner may do it.
+                if (partitions.Owns(path, processor.PartitionId))
+                {
+                    await processor.SweepAsync(cancellationToken);
+                }
             }
         }
 
@@ -542,6 +561,12 @@ public sealed class BrokerService(
             // Removed only after the message is durably in the log. The other order would
             // lose the message if the broker died in between; this one can at worst fire
             // it twice, which at-least-once delivery already allows for.
+            if (!partitions.Owns(path, message.PartitionId))
+            {
+                // Another broker owns that partition and will fire this one.
+                continue;
+            }
+
             var processor = Partition(
                 await partitions.GetAsync(path, cancellationToken), path, message.PartitionId);
 
@@ -550,7 +575,7 @@ public sealed class BrokerService(
         }
     }
 
-    private static PartitionProcessor Partition(PartitionProcessor[] processors, EntityPath path, int partitionId)
+    private PartitionProcessor Partition(PartitionProcessor[] processors, EntityPath path, int partitionId)
     {
         if (partitionId < 0 || partitionId >= processors.Length)
         {
@@ -558,7 +583,32 @@ public sealed class BrokerService(
                 $"Partition {partitionId} is out of range for '{path.Value}', which has {processors.Length}.");
         }
 
+        EnsureOwned(path, partitionId);
         return processors[partitionId];
+    }
+
+    /// <summary>
+    /// Refuses work on a partition this broker does not hold, naming the owner so the
+    /// caller can go straight there.
+    /// </summary>
+    /// <remarks>
+    /// This is an early decline, not the safety mechanism. The lease carried on every log
+    /// write is what actually prevents a fenced broker from corrupting a partition
+    /// (ADR 0003); without this check the request would simply fail later, on the write.
+    /// </remarks>
+    private void EnsureOwned(EntityPath path, int partitionId)
+    {
+        if (partitions.Owns(path, partitionId))
+        {
+            return;
+        }
+
+        throw new DistMqException(
+            DistMqErrorCode.NotOwner,
+            $"This broker does not own partition {partitionId} of '{path.Value}'.")
+        {
+            RedirectEndpoint = partitions.OwnerEndpoint(path, partitionId),
+        };
     }
 
     private static ReceivedMessage ToReceived(LockedMessage message, int partitionId) => new()

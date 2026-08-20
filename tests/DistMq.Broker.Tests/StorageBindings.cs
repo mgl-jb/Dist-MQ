@@ -98,3 +98,48 @@ public class AzureSessionScenarios(AzuriteFixture azurite) : SessionScenarios
             (new AzureObjectStore(options), new AzureTableStore(options)));
     }
 }
+
+/// <summary>
+/// Cluster behaviour over the in-memory store, whose lease clock we control — so lease
+/// expiry is instant rather than a 15-second wait.
+/// </summary>
+public class InMemoryClusterScenarios : ClusterScenarios
+{
+    protected override Task<(IObjectStore Objects, ILeaseProvider Leases, ITableStore Tables)> CreateStorageAsync()
+    {
+        var objects = new InMemoryObjectStore(Time);
+        return Task.FromResult<(IObjectStore, ILeaseProvider, ITableStore)>(
+            (objects, objects, new InMemoryTableStore(Time)));
+    }
+
+    protected override Task ExpireLeasesAsync(TimeSpan leaseDuration)
+    {
+        Time.Advance(leaseDuration + TimeSpan.FromSeconds(1));
+        return Task.CompletedTask;
+    }
+}
+
+/// <summary>
+/// The same over Azurite. Real lease expiry cannot be hurried, so this one waits — worth
+/// it, because lease fencing is the guarantee the whole ownership model rests on and it
+/// has to be shown against a real implementation of it.
+/// </summary>
+[Collection(AzuriteCollection.Name)]
+public class AzureClusterScenarios(AzuriteFixture azurite) : ClusterScenarios
+{
+    protected override Task<(IObjectStore Objects, ILeaseProvider Leases, ITableStore Tables)> CreateStorageAsync()
+    {
+        var options = new AzureStorageOptions { ConnectionString = azurite.ConnectionString };
+        var objects = new AzureObjectStore(options);
+        return Task.FromResult<(IObjectStore, ILeaseProvider, ITableStore)>(
+            (objects, objects, new AzureTableStore(options)));
+    }
+
+    protected override async Task ExpireLeasesAsync(TimeSpan leaseDuration)
+    {
+        // The broker's own clock still has to move, or message locks and heartbeats will
+        // not agree with the wall clock the storage service is using.
+        Time.Advance(leaseDuration + TimeSpan.FromSeconds(2));
+        await Task.Delay(leaseDuration + TimeSpan.FromSeconds(2));
+    }
+}

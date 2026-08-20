@@ -21,6 +21,9 @@ public sealed class BrokerOptions
     /// <summary>How often locks and time-to-live are swept.</summary>
     public TimeSpan MaintenanceInterval { get; set; } = TimeSpan.FromSeconds(5);
 
+    /// <summary>Cluster settings. Leave disabled for a single-broker deployment.</summary>
+    public Cluster.ClusterOptions Cluster { get; set; } = new();
+
     public bool UseInMemoryStorage =>
         string.Equals(Storage, "InMemory", StringComparison.OrdinalIgnoreCase);
 }

@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Runtime.CompilerServices;
+using DistMq.Broker.Cluster;
 using DistMq.Core;
 using DistMq.Core.Logs;
 using DistMq.Protocol;
@@ -32,7 +33,7 @@ public sealed class PartitionLog(
     IObjectStore objects,
     string entity,
     int partitionId,
-    Func<string?>? leaseIdProvider = null)
+    IPartitionOwnership? ownership = null)
 {
     private readonly SemaphoreSlim _writeGate = new(1, 1);
 
@@ -281,8 +282,15 @@ public sealed class PartitionLog(
         _segmentIndex++;
         _tailOffset = 0;
         _blockCount = 0;
-        await objects.CreateAppendObjectIfNotExistsAsync(
-            StorageNames.LogContainer, SegmentPath(_segmentIndex), cancellationToken);
+
+        var next = SegmentPath(_segmentIndex);
+        await objects.CreateAppendObjectIfNotExistsAsync(StorageNames.LogContainer, next, cancellationToken);
+
+        // The fence lives on the segment being written, so it has to move with the roll.
+        if (ownership is not null)
+        {
+            await ownership.MoveLeaseAsync(Entity, PartitionId, next, cancellationToken);
+        }
     }
 
     private async Task RefreshTailAsync(CancellationToken cancellationToken)
@@ -297,7 +305,26 @@ public sealed class PartitionLog(
     private string SegmentPath(uint segmentIndex) =>
         StorageNames.SegmentPath(Entity, PartitionId, segmentIndex);
 
-    private string? LeaseId() => leaseIdProvider?.Invoke();
+    /// <summary>
+    /// The lease to write under. Losing ownership mid-batch throws here rather than
+    /// letting an unfenced append through: passing no lease id to a blob another broker
+    /// has leased would be refused anyway, but a partition nobody has leased yet would
+    /// quietly accept it.
+    /// </summary>
+    private string? LeaseId()
+    {
+        if (ownership is null)
+        {
+            return null;
+        }
+
+        if (!ownership.TryGetLease(Entity, PartitionId, out var leaseId))
+        {
+            throw new LeaseLostException(SegmentPath(_segmentIndex));
+        }
+
+        return leaseId;
+    }
 
     private void EnsureInitialized()
     {

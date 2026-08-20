@@ -45,10 +45,11 @@ public static class StorageNames
     public static string SnapshotPrefix(string entity, int partitionId) =>
         $"{entity}/{partitionId:D5}/snapshots/";
 
-    public static string OwnerPath(string entity, int partitionId) =>
-        $"{entity}/{partitionId:D5}/owner";
-
-    public const string CoordinatorPath = "namespace/coordinator";
+    /// <summary>
+    /// Leader-election target, scoped to the namespace so two namespaces sharing a storage
+    /// account elect independently rather than contending for one lease.
+    /// </summary>
+    public static string CoordinatorPath(string ns) => $"{ns}/coordinator";
 
     /// <summary>
     /// Encodes an entity path for use in a table partition or row key.

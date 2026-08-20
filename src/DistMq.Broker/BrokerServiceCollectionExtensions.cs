@@ -1,3 +1,4 @@
+using DistMq.Broker.Cluster;
 using DistMq.Broker.Partitions;
 using DistMq.Broker.Storage;
 using DistMq.Broker.Workers;
@@ -60,11 +61,43 @@ public static class BrokerServiceCollectionExtensions
         services.AddSingleton(provider => new DeduplicationStore(provider.GetRequiredService<ITableStore>()));
         services.AddSingleton(provider => new DeferredStore(provider.GetRequiredService<ITableStore>()));
 
+        services.AddSingleton(provider =>
+        {
+            var broker = provider.GetRequiredService<BrokerOptions>();
+            broker.Cluster.Namespace = broker.Namespace;
+            return broker.Cluster;
+        });
+        services.AddSingleton(provider => new MemberStore(
+            provider.GetRequiredService<ITableStore>(),
+            provider.GetRequiredService<BrokerOptions>().Namespace));
+
+        services.AddSingleton(provider => new AssignmentStore(
+            provider.GetRequiredService<ITableStore>(),
+            provider.GetRequiredService<BrokerOptions>().Namespace));
+
+        services.AddSingleton(provider => new ClusterCoordinator(
+            provider.GetRequiredService<ClusterOptions>(),
+            provider.GetRequiredService<MemberStore>(),
+            provider.GetRequiredService<AssignmentStore>(),
+            provider.GetRequiredService<EntityStore>(),
+            provider.GetRequiredService<ILeaseProvider>(),
+            provider.GetRequiredService<IObjectStore>(),
+            provider.GetRequiredService<TimeProvider>(),
+            provider.GetRequiredService<ILogger<ClusterCoordinator>>()));
+
+        // With clustering off, this broker owns everything and takes no leases — the
+        // right behaviour for a single node, not a stub.
+        services.AddSingleton<IPartitionOwnership>(provider =>
+            provider.GetRequiredService<ClusterOptions>().Enabled
+                ? provider.GetRequiredService<ClusterCoordinator>()
+                : SoleOwnership.Instance);
+
         services.AddSingleton(provider => new PartitionRegistry(
             provider.GetRequiredService<EntityStore>(),
             provider.GetRequiredService<IObjectStore>(),
             provider.GetRequiredService<TimeProvider>(),
-            provider.GetRequiredService<DeferredStore>()));
+            provider.GetRequiredService<DeferredStore>(),
+            provider.GetRequiredService<IPartitionOwnership>()));
 
         services.AddSingleton(provider => new BrokerService(
             provider.GetRequiredService<EntityStore>(),
@@ -80,6 +113,25 @@ public static class BrokerServiceCollectionExtensions
             Interval = provider.GetRequiredService<BrokerOptions>().MaintenanceInterval,
         });
 
+        services.AddHostedService<BackgroundService>(provider =>
+        {
+            var clusterOptions = provider.GetRequiredService<ClusterOptions>();
+            if (clusterOptions.Enabled)
+            {
+                var coordinator = provider.GetRequiredService<ClusterCoordinator>();
+                var registry = provider.GetRequiredService<PartitionRegistry>();
+                coordinator.PartitionAcquired = registry.ReloadPartitionAsync;
+            }
+
+            return clusterOptions.Enabled
+                ? new ClusterWorker(
+                    provider.GetRequiredService<ClusterCoordinator>(),
+                    clusterOptions,
+                    provider.GetRequiredService<ILogger<ClusterWorker>>(),
+                    provider.GetRequiredService<TimeProvider>())
+                : new NoOpWorker();
+        });
+
         services.AddGrpc();
         return services;
     }
@@ -91,6 +143,12 @@ public static class BrokerServiceCollectionExtensions
         await storage.Objects.InitializeAsync();
         await storage.Tables.InitializeAsync();
     }
+}
+
+/// <summary>Placeholder for the cluster worker when clustering is disabled.</summary>
+internal sealed class NoOpWorker : BackgroundService
+{
+    protected override Task ExecuteAsync(CancellationToken stoppingToken) => Task.CompletedTask;
 }
 
 /// <summary>The storage trio the broker runs on, resolved as one unit so they always agree.</summary>

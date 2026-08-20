@@ -288,7 +288,12 @@ number is returned. A background sweeper deletes expired rows.
 ```
 
 1. **Membership.** Every broker heartbeats a row into `Members` with its node ID
-   and endpoints. A member whose heartbeat is stale is considered dead.
+   and endpoints. A member whose heartbeat is stale is considered dead. The
+   staleness threshold is never longer than the lease duration: heartbeats and
+   lease renewals ride the same tick, so a broker loses both at once, and letting
+   membership outlive the lease would leave the leader assigning partitions to a
+   node that can no longer hold them — those partitions unowned, and the messages
+   on them unreachable, for the difference.
 2. **Election.** Brokers race to take a renewable lease on the `coordinator`
    blob. The winner is leader. Losing the lease means immediately ceasing leader
    work.
@@ -296,8 +301,12 @@ number is returned. A background sweeper deletes expired rows.
    hashing — each partition picks the live node with the highest
    `hash(partition, node)`. Membership changes move only the partitions that must
    move. The plan is written to `Assignments`.
-4. **Acquisition.** Each broker reads its assignment, then *acquires the blob
-   lease* for those partitions and releases leases it should no longer hold.
+4. **Acquisition.** Each broker reads its assignment, then *acquires the lease* on
+   the current segment of those partitions, and releases leases it should no
+   longer hold. Taking a partition over also means re-reading it: another broker
+   may have appended to it since this one last looked, so whatever is in memory
+   is discarded and replayed from the log. Keeping it would silently lose every
+   message written while this broker was not the owner.
 5. **Fencing.** Every log append and state write carries the lease ID. A broker
    that lost its lease gets `412`, drops the partition and stops serving it.
 
@@ -309,9 +318,18 @@ holder.
 ## Request routing
 
 A client may connect to any broker. If the target partition is owned elsewhere,
-the broker forwards over an internal gRPC channel and returns a `NotOwner`
-redirect hint with the owner's endpoint. The SDK caches the topology and
-connects directly afterwards, invalidating the cache whenever a redirect arrives.
+the broker refuses the request with `NotOwner` and names the owner's endpoint;
+the SDK caches that topology and goes directly to the owner from then on,
+invalidating the cache whenever another redirect arrives. A receive is the one
+exception — it serves what this broker owns and simply skips the rest, rather
+than failing a request that can be partly satisfied.
+
+Redirecting rather than proxying is deliberate. A forwarding broker doubles the
+network hops for every message on a mis-addressed connection and has to be given
+its own loop protection; telling the client where to go costs one round trip,
+once, and every subsequent request takes the short path. The cost is that clients
+must understand the redirect, which is why it is part of the shared error model
+rather than something the SDK invents.
 
 ## Failure analysis
 

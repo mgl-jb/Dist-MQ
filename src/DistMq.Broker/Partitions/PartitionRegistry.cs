@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using DistMq.Broker.Cluster;
 using DistMq.Broker.Storage;
 using DistMq.Core;
 using DistMq.Core.Entities;
@@ -20,8 +21,11 @@ public sealed class PartitionRegistry(
     EntityStore entities,
     IObjectStore objects,
     TimeProvider? timeProvider = null,
-    DeferredStore? deferredStore = null)
+    DeferredStore? deferredStore = null,
+    IPartitionOwnership? ownership = null)
 {
+    private readonly IPartitionOwnership _ownership = ownership ?? SoleOwnership.Instance;
+
     private readonly ConcurrentDictionary<string, Lazy<Task<PartitionProcessor[]>>> _partitions =
         new(StringComparer.Ordinal);
 
@@ -100,6 +104,25 @@ public sealed class PartitionRegistry(
         Forget(path.DeadLetter());
     }
 
+    /// <summary>
+    /// Re-reads a partition from storage. Called when this broker takes the partition over,
+    /// because whatever it holds in memory predates the previous owner's writes.
+    /// </summary>
+    public async Task ReloadPartitionAsync(string entity, int partitionId, CancellationToken cancellationToken = default)
+    {
+        if (!_partitions.TryGetValue(entity, out var lazy) || !lazy.IsValueCreated)
+        {
+            // Not loaded here yet, so the first access will read current state anyway.
+            return;
+        }
+
+        var processors = await lazy.Value.WaitAsync(cancellationToken);
+        if (partitionId >= 0 && partitionId < processors.Length)
+        {
+            await processors[partitionId].ReloadAsync(cancellationToken);
+        }
+    }
+
     /// <summary>Drops cached partitions, e.g. after the entity is deleted.</summary>
     public void Forget(EntityPath path)
     {
@@ -109,6 +132,12 @@ public sealed class PartitionRegistry(
     }
 
     public IReadOnlyCollection<string> LoadedEntities => _partitions.Keys.ToList();
+
+    /// <summary>True when this broker may serve the partition.</summary>
+    public bool Owns(EntityPath path, int partitionId) => _ownership.TryGetLease(path.Value, partitionId, out _);
+
+    /// <summary>Where to send a client whose request landed on the wrong broker.</summary>
+    public string? OwnerEndpoint(EntityPath path, int partitionId) => _ownership.OwnerEndpoint(path.Value, partitionId);
 
     private async Task<PartitionProcessor[]> CreateAsync(EntityPath path, CancellationToken cancellationToken)
     {
@@ -124,9 +153,14 @@ public sealed class PartitionRegistry(
 
         for (var partitionId = 0; partitionId < processors.Length; partitionId++)
         {
-            var log = new PartitionLog(objects, path.Value, partitionId);
+            var id = partitionId;
+
+            // Ownership is consulted on every write rather than captured once: it can
+            // change under a long-lived processor, and the write must carry whatever is
+            // true at that moment or storage cannot fence it.
+            var log = new PartitionLog(objects, path.Value, id, _ownership);
             var processor = new PartitionProcessor(
-                descriptor, partitionId, log, objects, DeadLetterAsync, _time, deferredStore);
+                descriptor, id, log, objects, DeadLetterAsync, _time, deferredStore);
 
             foreach (var subscription in subscriptions)
             {

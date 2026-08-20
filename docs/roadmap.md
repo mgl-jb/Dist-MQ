@@ -20,8 +20,8 @@ suite green and lands its own documentation.
 - [x] **7. Scheduled, deferred, dedup, batching** — timer worker, deferral index,
   dedup window and sweeper, batched append/settle, credit-based prefetch.
 - [x] **8. Sessions** — session locks, per-session FIFO, session state.
-- [ ] **9. Clustering** — membership, leader election, rendezvous assignment,
-  lease fencing, forwarding, rebalance; failover and fencing tests.
+- [x] **9. Clustering** — membership, leader election, rendezvous assignment,
+  lease fencing, redirect-on-not-owner, rebalance; failover and fencing tests.
 - [ ] **10. Client SDK, CLI, WebSocket bridge** — sender/receiver/processor,
   session processor, admin client, retries, topology-aware reconnect.
 - [ ] **11. Observability and infra** — OpenTelemetry, health endpoints,

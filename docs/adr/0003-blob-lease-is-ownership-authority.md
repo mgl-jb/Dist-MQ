@@ -11,9 +11,16 @@ safety corrupt data during split brain.
 
 ## Decision
 
-Ownership is holding a renewable lease on the partition's `owner` blob. Every log
-append and state write carries the lease ID. The leader's `Assignments` table is
-advisory only — it tells a broker which leases to *try* to take.
+Ownership is holding a renewable lease on the partition's **current log segment** —
+the blob the broker actually appends to. Every log append and state write carries
+that lease ID. The leader's `Assignments` table is advisory only: it tells a broker
+which leases to *try* to take.
+
+The lease must be on the write target, not on a separate marker blob. An earlier
+version of this design leased a per-partition `owner` blob; it described the right
+protocol and enforced nothing, because a lease on one blob does not fence a write
+to another. When the log rolls, the new segment is leased before the old one is
+released.
 
 ## Consequences
 

@@ -134,6 +134,48 @@ public sealed class PartitionProcessor
                 return;
             }
 
+            await RecoverCoreAsync(cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Rebuilds state from storage after this broker takes the partition over from another.
+    /// </summary>
+    /// <remarks>
+    /// Taking ownership is not the same as having current state. Another broker may have
+    /// been appending to this partition since we last read it — which is exactly what
+    /// happens on failover — so whatever is in memory is stale and has to be thrown away
+    /// and replayed. Keeping it would silently lose every message written while we were not
+    /// the owner.
+    /// </remarks>
+    public async Task ReloadAsync(CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            foreach (var (name, consumer) in _consumers.ToList())
+            {
+                _consumers[name] = ConsumerContext.For(consumer.Descriptor, name.Length == 0 ? null : name);
+            }
+
+            _nextLocalSequence = 0;
+            _recordsSinceSnapshot = 0;
+            _recovered = false;
+            await RecoverCoreAsync(cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    private async Task RecoverCoreAsync(CancellationToken cancellationToken)
+    {
+        {
             await Log.InitializeAsync(cancellationToken);
             _replayFrom = new LogPosition(0, 0);
 
@@ -154,10 +196,6 @@ public sealed class PartitionProcessor
 
             await ReplayAsync(cancellationToken);
             _recovered = true;
-        }
-        finally
-        {
-            _gate.Release();
         }
     }
 
