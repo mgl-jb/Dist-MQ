@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DistMq.Storage.Azure\DistMq.Storage.Azure.csproj" />
+    <ProjectReference Include="..\..\src\DistMq.Storage.InMemory\DistMq.Storage.InMemory.csproj" />
+  </ItemGroup>
+</Project>

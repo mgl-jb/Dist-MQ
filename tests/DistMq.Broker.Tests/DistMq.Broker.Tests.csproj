@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DistMq.Broker\DistMq.Broker.csproj" />
+    <ProjectReference Include="..\..\src\DistMq.Client\DistMq.Client.csproj" />
+    <ProjectReference Include="..\..\src\DistMq.Storage.InMemory\DistMq.Storage.InMemory.csproj" />
+  </ItemGroup>
+</Project>

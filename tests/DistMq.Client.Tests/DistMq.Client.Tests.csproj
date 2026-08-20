@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DistMq.Client\DistMq.Client.csproj" />
+  </ItemGroup>
+</Project>

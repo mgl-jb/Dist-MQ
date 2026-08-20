@@ -1,0 +1,1 @@
+syntax = "proto3"; package distmq.v1; option csharp_namespace = "DistMq.Protocol"; message Ping { string value = 1; }

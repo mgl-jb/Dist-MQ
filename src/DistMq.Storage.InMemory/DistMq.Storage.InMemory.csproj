@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\DistMq.Storage.Abstractions\DistMq.Storage.Abstractions.csproj" />
+  </ItemGroup>
+</Project>

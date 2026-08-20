@@ -1,0 +1,12 @@
+bin/
+obj/
+artifacts/
+*.user
+.vs/
+.idea/
+__azurite_db*.json
+__blobstorage__/
+__queuestorage__/
+__tablestorage__/
+TestResults/
+*.received.*

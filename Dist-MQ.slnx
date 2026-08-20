@@ -1,0 +1,18 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/DistMq.Broker/DistMq.Broker.csproj" />
+    <Project Path="src/DistMq.Cli/DistMq.Cli.csproj" />
+    <Project Path="src/DistMq.Client/DistMq.Client.csproj" />
+    <Project Path="src/DistMq.Core/DistMq.Core.csproj" />
+    <Project Path="src/DistMq.Protocol/DistMq.Protocol.csproj" />
+    <Project Path="src/DistMq.Storage.Abstractions/DistMq.Storage.Abstractions.csproj" />
+    <Project Path="src/DistMq.Storage.Azure/DistMq.Storage.Azure.csproj" />
+    <Project Path="src/DistMq.Storage.InMemory/DistMq.Storage.InMemory.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/DistMq.Broker.Tests/DistMq.Broker.Tests.csproj" />
+    <Project Path="tests/DistMq.Client.Tests/DistMq.Client.Tests.csproj" />
+    <Project Path="tests/DistMq.Core.Tests/DistMq.Core.Tests.csproj" />
+    <Project Path="tests/DistMq.Storage.Tests/DistMq.Storage.Tests.csproj" />
+  </Folder>
+</Solution>
