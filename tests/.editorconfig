@@ -1,0 +1,6 @@
+[*.cs]
+# The storage suites call I/O methods whose CancellationToken parameters are optional.
+# Threading TestContext.Current.CancellationToken through every call adds noise without
+# adding safety here: the test platform already enforces a per-test timeout, and the
+# fixtures tear their emulator down in DisposeAsync.
+dotnet_diagnostic.xUnit1051.severity = none
