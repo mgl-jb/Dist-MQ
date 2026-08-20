@@ -111,8 +111,16 @@ Keys use `|` as a separator; `{ns}` is the namespace name.
 | `Assignments` | `{ns}` | `{entity}\|{part:D5}` | assigned node ID, generation, assigned UTC |
 
 `Scheduled` is bucketed by minute so the timer worker scans one narrow partition
-range per tick instead of the whole table. `Dedup` is bucketed by a hash of the
-message ID so that expiry sweeps parallelise and no single partition becomes hot.
+range per tick instead of the whole table, and the minute is encoded into the
+returned sequence number so cancelling is a point delete rather than a scan.
+`Dedup` is bucketed by a hash of the message ID so that expiry sweeps
+parallelise and no single partition becomes hot.
+
+**Key encoding.** Table Storage rejects `/`, `\`, `#` and `?` in partition and
+row keys, and entity paths are built from slashes. Every key that carries an
+entity path goes through `StorageNames.EntityKey`, which maps separators to `|`.
+Message IDs are hex-encoded for the same reason: they are user-supplied and may
+contain anything.
 
 ## Sequence numbers
 

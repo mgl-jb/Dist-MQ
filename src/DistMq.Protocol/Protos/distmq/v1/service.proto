@@ -99,6 +99,37 @@ message PeekResponse {
   repeated ReceivedMessage messages = 1;
 }
 
+message ScheduleMessageRequest {
+  string entity = 1;
+  MessageEnvelope message = 2;
+  int64 due_at_ticks = 3;
+}
+
+message ScheduleMessageResponse {
+  // Pass this to CancelScheduledMessage to call the delivery off.
+  uint64 sequence_number = 1;
+}
+
+message CancelScheduledMessageRequest {
+  string entity = 1;
+  uint64 sequence_number = 2;
+}
+
+message CancelScheduledMessageResponse {
+  // False when the message had already fired or was already cancelled.
+  bool cancelled = 1;
+}
+
+message ReceiveDeferredRequest {
+  string entity = 1;
+  repeated uint64 sequence_numbers = 2;
+  string receiver_id = 3;
+}
+
+message ReceiveDeferredResponse {
+  repeated ReceivedMessage messages = 1;
+}
+
 // The data plane. Every method routes to the broker that owns the target
 // partition, forwarding internally when this broker does not own it.
 service Messaging {
@@ -107,4 +138,7 @@ service Messaging {
   rpc Settle(SettleRequest) returns (SettleResponse);
   rpc RenewLock(RenewLockRequest) returns (RenewLockResponse);
   rpc Peek(PeekRequest) returns (PeekResponse);
+  rpc ScheduleMessage(ScheduleMessageRequest) returns (ScheduleMessageResponse);
+  rpc CancelScheduledMessage(CancelScheduledMessageRequest) returns (CancelScheduledMessageResponse);
+  rpc ReceiveDeferred(ReceiveDeferredRequest) returns (ReceiveDeferredResponse);
 }

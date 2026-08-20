@@ -102,6 +102,62 @@ public sealed class MessagingGrpcService(BrokerService broker) : Messaging.Messa
         }
     }
 
+    public override async Task<ScheduleMessageResponse> ScheduleMessage(
+        ScheduleMessageRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var sequenceNumber = await broker.ScheduleMessageAsync(
+                ParsePath(request.Entity),
+                request.Message,
+                new DateTimeOffset(request.DueAtTicks, TimeSpan.Zero),
+                context.CancellationToken);
+
+            return new ScheduleMessageResponse { SequenceNumber = sequenceNumber };
+        }
+        catch (DistMqException ex)
+        {
+            throw ToRpc(ex);
+        }
+    }
+
+    public override async Task<CancelScheduledMessageResponse> CancelScheduledMessage(
+        CancelScheduledMessageRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var cancelled = await broker.CancelScheduledMessageAsync(
+                ParsePath(request.Entity), request.SequenceNumber, context.CancellationToken);
+
+            return new CancelScheduledMessageResponse { Cancelled = cancelled };
+        }
+        catch (DistMqException ex)
+        {
+            throw ToRpc(ex);
+        }
+    }
+
+    public override async Task<ReceiveDeferredResponse> ReceiveDeferred(
+        ReceiveDeferredRequest request, ServerCallContext context)
+    {
+        try
+        {
+            var messages = await broker.ReceiveDeferredAsync(
+                ParsePath(request.Entity),
+                request.SequenceNumbers,
+                string.IsNullOrEmpty(request.ReceiverId) ? context.Peer : request.ReceiverId,
+                context.CancellationToken);
+
+            var response = new ReceiveDeferredResponse();
+            response.Messages.AddRange(messages);
+            return response;
+        }
+        catch (DistMqException ex)
+        {
+            throw ToRpc(ex);
+        }
+    }
+
     private static EntityPath ParsePath(string entity)
     {
         if (!EntityPath.TryParse(entity, out var path))

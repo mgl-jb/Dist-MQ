@@ -22,8 +22,18 @@ public sealed record EntityRuntimeInfo(
 /// adapters over this (ADR 0010), so the three transports cannot drift apart in
 /// behaviour — there is only one implementation of the semantics.
 /// </summary>
-public sealed class BrokerService(EntityStore entities, PartitionRegistry partitions)
+public sealed class BrokerService(
+    EntityStore entities,
+    PartitionRegistry partitions,
+    ScheduledStore? scheduled = null,
+    DeduplicationStore? deduplication = null,
+    TimeProvider? timeProvider = null)
 {
+    private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
+
+    /// <summary>How far back the scheduler re-checks, so a broker that was briefly down still fires what it missed.</summary>
+    private static readonly TimeSpan ScheduleLookBack = TimeSpan.FromHours(1);
+
     public async Task<EntityDescriptor> CreateEntityAsync(
         EntityDescriptor descriptor,
         CancellationToken cancellationToken = default)
@@ -89,13 +99,17 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         var descriptor = await entities.RequireAsync(path, cancellationToken);
         var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
 
-        long active = 0, locked = 0, deferred = 0, scheduled = 0;
+        long active = 0, locked = 0, deferred = 0, scheduledCount = 0;
         foreach (var counts in processors.Select(processor => processor.GetCounts(consumer)))
         {
             active += counts.Active;
             locked += counts.Locked;
             deferred += counts.Deferred;
-            scheduled += counts.Scheduled;
+        }
+
+        if (scheduled is not null && !path.IsDeadLetter && path.Kind != EntityKind.Subscription)
+        {
+            scheduledCount = await scheduled.CountAsync(path, _time.GetUtcNow(), cancellationToken);
         }
 
         long deadLettered = 0;
@@ -106,7 +120,7 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         }
 
         return new EntityRuntimeInfo(
-            path.Value, descriptor.PartitionCount, active, locked, deferred, scheduled, deadLettered);
+            path.Value, descriptor.PartitionCount, active, locked, deferred, scheduledCount, deadLettered);
     }
 
     public async Task<IReadOnlyList<ulong>> SendAsync(
@@ -131,6 +145,21 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
             }
         }
 
+        var now = _time.GetUtcNow();
+        var alreadySeen = new Dictionary<int, ulong>();
+
+        if (deduplication is not null && descriptor.DuplicateDetectionEnabled)
+        {
+            for (var index = 0; index < messages.Count; index++)
+            {
+                var original = await deduplication.FindAsync(path, messages[index].MessageId, now, cancellationToken);
+                if (original is { } sequenceNumber)
+                {
+                    alreadySeen[index] = sequenceNumber;
+                }
+            }
+        }
+
         // Group by partition so a batch bound for one partition costs one log append,
         // rather than one per message.
         var byPartition = new Dictionary<PartitionProcessor, List<MessageEnvelope>>();
@@ -138,6 +167,11 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
 
         for (var index = 0; index < messages.Count; index++)
         {
+            if (alreadySeen.ContainsKey(index))
+            {
+                continue;
+            }
+
             var processor = await partitions.RouteAsync(path, messages[index], cancellationToken);
             if (!byPartition.TryGetValue(processor, out var batch))
             {
@@ -163,6 +197,27 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
                 if (owner == processor)
                 {
                     sequenceNumbers[index] = assigned[position++];
+                }
+            }
+        }
+
+        foreach (var (index, sequenceNumber) in alreadySeen)
+        {
+            sequenceNumbers[index] = sequenceNumber;
+        }
+
+        if (deduplication is not null && descriptor.DuplicateDetectionEnabled)
+        {
+            // Written after the append, never before. Reserving the id first would turn a
+            // failed append into a permanent block: the id would be remembered for a
+            // message that never landed and every retry dropped as a duplicate.
+            var expiresAt = now + descriptor.DuplicateDetectionWindow!.Value;
+            for (var index = 0; index < messages.Count; index++)
+            {
+                if (!alreadySeen.ContainsKey(index))
+                {
+                    await deduplication.RememberAsync(
+                        path, messages[index].MessageId, sequenceNumbers[index], expiresAt, cancellationToken);
                 }
             }
         }
@@ -230,6 +285,69 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         return results;
     }
 
+    /// <summary>Holds a message until its due time, returning the id needed to cancel it.</summary>
+    public async Task<ulong> ScheduleMessageAsync(
+        EntityPath path,
+        MessageEnvelope message,
+        DateTimeOffset dueAt,
+        CancellationToken cancellationToken = default)
+    {
+        if (scheduled is null)
+        {
+            throw DistMqException.Invalid("Scheduling is not enabled on this broker.");
+        }
+
+        await entities.RequireAsync(path, cancellationToken);
+
+        if (dueAt <= _time.GetUtcNow())
+        {
+            // Already due: there is nothing to wait for, so enqueue it directly rather
+            // than round-tripping through the schedule table.
+            var sequenceNumbers = await SendAsync(path, [message], cancellationToken);
+            return sequenceNumbers[0];
+        }
+
+        var processor = await partitions.RouteAsync(path, message, cancellationToken);
+        message.ScheduledEnqueueTimeTicks = dueAt.UtcTicks;
+
+        return await scheduled.ScheduleAsync(path, processor.PartitionId, message, dueAt, cancellationToken);
+    }
+
+    public async Task<bool> CancelScheduledMessageAsync(
+        EntityPath path,
+        ulong sequenceNumber,
+        CancellationToken cancellationToken = default)
+    {
+        if (scheduled is null)
+        {
+            throw DistMqException.Invalid("Scheduling is not enabled on this broker.");
+        }
+
+        return await scheduled.CancelAsync(path, sequenceNumber, cancellationToken);
+    }
+
+    /// <summary>Locks previously deferred messages by sequence number.</summary>
+    public async Task<IReadOnlyList<ReceivedMessage>> ReceiveDeferredAsync(
+        EntityPath path,
+        IReadOnlyList<ulong> sequenceNumbers,
+        string receiverId,
+        CancellationToken cancellationToken = default)
+    {
+        var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
+        var received = new List<ReceivedMessage>(sequenceNumbers.Count);
+
+        foreach (var group in sequenceNumbers.GroupBy(SequenceNumber.PartitionOf))
+        {
+            var processor = Partition(processors, path, group.Key);
+            var locked = await processor.ReceiveDeferredAsync(
+                consumer, group.ToList(), receiverId, cancellationToken);
+
+            received.AddRange(locked.Select(message => ToReceived(message, processor.PartitionId)));
+        }
+
+        return received;
+    }
+
     public async Task<DateTimeOffset> RenewLockAsync(
         EntityPath path,
         ulong sequenceNumber,
@@ -266,9 +384,14 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         return peeked.OrderBy(message => message.SequenceNumber).ToList();
     }
 
-    /// <summary>Runs the lock-expiry and time-to-live sweep over every loaded partition.</summary>
+    /// <summary>
+    /// Runs the periodic work: expiring locks and messages, enqueuing scheduled messages
+    /// that have come due, and clearing expired duplicate-detection rows.
+    /// </summary>
     public async Task SweepAsync(CancellationToken cancellationToken = default)
     {
+        var now = _time.GetUtcNow();
+
         foreach (var entity in partitions.LoadedEntities)
         {
             if (!EntityPath.TryParse(entity, out var path))
@@ -280,6 +403,43 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
             {
                 await processor.SweepAsync(cancellationToken);
             }
+        }
+
+        // Entities with nothing loaded still have schedules to fire, so this walks the
+        // configured entities rather than only the ones already in memory.
+        foreach (var descriptor in await entities.ListAsync(cancellationToken))
+        {
+            if (descriptor.Path.Kind == EntityKind.Subscription)
+            {
+                continue;
+            }
+
+            await DeliverScheduledAsync(descriptor.Path, now, cancellationToken);
+
+            if (deduplication is not null && descriptor.DuplicateDetectionEnabled)
+            {
+                await deduplication.SweepAsync(descriptor.Path, now, cancellationToken);
+            }
+        }
+    }
+
+    private async Task DeliverScheduledAsync(EntityPath path, DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        if (scheduled is null)
+        {
+            return;
+        }
+
+        foreach (var message in await scheduled.ReadDueAsync(path, now, ScheduleLookBack, cancellationToken))
+        {
+            // Removed only after the message is durably in the log. The other order would
+            // lose the message if the broker died in between; this one can at worst fire
+            // it twice, which at-least-once delivery already allows for.
+            var processor = Partition(
+                await partitions.GetAsync(path, cancellationToken), path, message.PartitionId);
+
+            await processor.SendAsync([message.Message], cancellationToken);
+            await scheduled.RemoveAsync(path, message.SequenceNumber, cancellationToken);
         }
     }
 

@@ -50,6 +50,17 @@ public static class StorageNames
 
     public const string CoordinatorPath = "namespace/coordinator";
 
+    /// <summary>
+    /// Encodes an entity path for use in a table partition or row key.
+    /// </summary>
+    /// <remarks>
+    /// Table Storage rejects '/', '\', '#' and '?' in keys, and entity paths are built
+    /// from slashes. Every table key that carries an entity path goes through this, so the
+    /// encoding is defined once instead of being re-invented — and forgotten — per store.
+    /// </remarks>
+    public static string EntityKey(string entityPath) =>
+        entityPath.Replace('/', '|').Replace('\\', '|').Replace('#', '_').Replace('?', '_');
+
     public static string SessionStatePath(string entity, string sessionId) =>
         $"{entity}/{sessionId}.state";
 

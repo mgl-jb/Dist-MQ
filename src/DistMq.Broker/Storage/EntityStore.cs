@@ -65,8 +65,7 @@ public sealed class EntityStore(ITableStore tables, string ns = "default")
     /// </summary>
     private static readonly JsonSerializerOptions RuleJson = new(JsonSerializerDefaults.Web);
 
-    /// <summary>Row keys cannot contain '/', so path separators are encoded.</summary>
-    private static string RowKey(EntityPath path) => path.Value.Replace('/', '|');
+    private static string RowKey(EntityPath path) => StorageNames.EntityKey(path.Value);
 
     private StorageEntity ToEntity(EntityDescriptor descriptor)
     {

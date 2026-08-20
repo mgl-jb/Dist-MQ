@@ -175,6 +175,21 @@ public abstract class TableStoreConformance : IAsyncLifetime
     }
 
     [Fact]
+    public async Task EncodedEntityPathsAreAcceptableKeys()
+    {
+        // Table Storage rejects '/' in keys and entity paths are full of them, so every
+        // key carrying a path goes through StorageNames.EntityKey. In-memory storage would
+        // happily accept the raw path, which is exactly how that bug hides until deployment.
+        var partitionKey = StorageNames.EntityKey("topics/events/subscriptions/billing/$deadletterqueue");
+        var entity = new StorageEntity(partitionKey, "0001") { ["Value"] = "ok" };
+
+        await Store.InsertAsync(Table, entity);
+
+        var loaded = await Store.GetAsync(Table, partitionKey, "0001");
+        Assert.Equal("ok", loaded!.GetString("Value"));
+    }
+
+    [Fact]
     public async Task TransactionAppliesEveryOperation()
     {
         var operations = Enumerable.Range(0, 10)

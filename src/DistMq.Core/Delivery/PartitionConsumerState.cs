@@ -133,6 +133,11 @@ public sealed class PartitionConsumerState
     /// <summary>Settles a message successfully. The frontier advances if this filled the hole at it.</summary>
     public SettleResult Complete(ulong sequenceNumber, string lockToken, DateTimeOffset now)
     {
+        if (!_tracked.ContainsKey(sequenceNumber) && _deferred.ContainsKey(sequenceNumber))
+        {
+            return CompleteDeferred(sequenceNumber, lockToken, now);
+        }
+
         var result = CheckLock(sequenceNumber, lockToken, now, out _);
         if (result != SettleResult.Ok)
         {
@@ -154,6 +159,21 @@ public sealed class PartitionConsumerState
         DateTimeOffset now,
         IDictionary<string, PropertyValue>? modifiedProperties = null)
     {
+        if (!_tracked.ContainsKey(sequenceNumber) && _deferred.TryGetValue(sequenceNumber, out var deferred))
+        {
+            // Abandoning a deferred message releases the lock but leaves it deferred: it
+            // was set aside deliberately and only a sequence number brings it back.
+            if (deferred.LockToken != lockToken || deferred.LockedUntil <= now)
+            {
+                return new AbandonOutcome(SettleResult.LockLost, 0, false, null);
+            }
+
+            deferred.LockToken = null;
+            deferred.LockedUntil = default;
+            deferred.State = MessageState.Deferred;
+            return new AbandonOutcome(SettleResult.Ok, deferred.DeliveryCount, false, deferred.Envelope);
+        }
+
         var result = CheckLock(sequenceNumber, lockToken, now, out var message);
         if (result != SettleResult.Ok)
         {
@@ -240,6 +260,17 @@ public sealed class PartitionConsumerState
         string reason,
         string? description = null)
     {
+        if (!_tracked.ContainsKey(sequenceNumber) && _deferred.TryGetValue(sequenceNumber, out var deferred))
+        {
+            if (deferred.LockToken != lockToken || deferred.LockedUntil <= now)
+            {
+                return new DeadLetterOutcome(SettleResult.LockLost, null);
+            }
+
+            _deferred.Remove(sequenceNumber);
+            return new DeadLetterOutcome(SettleResult.Ok, Annotate(deferred.Envelope, reason, description));
+        }
+
         var result = CheckLock(sequenceNumber, lockToken, now, out var message);
         if (result != SettleResult.Ok)
         {
@@ -426,6 +457,9 @@ public sealed class PartitionConsumerState
         }
     }
 
+    /// <summary>True when the sequence number is currently deferred.</summary>
+    public bool IsDeferred(ulong sequenceNumber) => _deferred.ContainsKey(sequenceNumber);
+
     /// <summary>Restores a message the snapshot recorded as deferred.</summary>
     public void RestoreDeferred(ulong sequenceNumber, MessageEnvelope envelope, uint deliveryCount, DateTimeOffset now)
     {
@@ -474,12 +508,17 @@ public sealed class PartitionConsumerState
 
     private MessageEnvelope TakeForDeadLetter(TrackedMessage message, string reason, string? description)
     {
-        var envelope = message.Envelope.Clone();
+        var envelope = Annotate(message.Envelope, reason, description);
+        Settle(message.SequenceNumber);
+        return envelope;
+    }
+
+    private MessageEnvelope Annotate(MessageEnvelope message, string reason, string? description)
+    {
+        var envelope = message.Clone();
         envelope.DeadLetterReason = reason;
         envelope.DeadLetterDescription = description ?? string.Empty;
         envelope.DeadLetterSource = Entity.Path.Value;
-
-        Settle(message.SequenceNumber);
         return envelope;
     }
 

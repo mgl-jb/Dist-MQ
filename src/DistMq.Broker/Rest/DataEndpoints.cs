@@ -1,3 +1,4 @@
+using DistMq.Core;
 using DistMq.Core.Entities;
 using DistMq.Protocol;
 using Google.Protobuf;
@@ -25,6 +26,15 @@ public sealed record ReceivedMessageDto(
     long LockedUntilTicks,
     int PartitionId,
     MessageDto Message);
+
+/// <summary>Settles a batch in one call: one log append and one table transaction instead of N.</summary>
+public sealed record BatchSettleRequestDto(string Action, List<SettleRequestDto> Settlements);
+
+/// <summary>Request body for scheduling a message.</summary>
+public sealed record ScheduleMessageRequestDto(MessageDto Message, DateTimeOffset DueAt);
+
+/// <summary>Request body for receiving deferred messages by sequence number.</summary>
+public sealed record ReceiveDeferredRequestDto(List<ulong> SequenceNumbers, string? ReceiverId = null);
 
 public sealed record SettleRequestDto(
     ulong SequenceNumber,
@@ -158,6 +168,76 @@ public static class DataEndpoints
                     : Results.Conflict(new { error = results[0].Error, sequenceNumber = results[0].SequenceNumber });
             });
         }
+
+        group.MapPost("/messages/schedule", async (
+            string name,
+            string? subscription,
+            ScheduleMessageRequestDto request,
+            BrokerService broker,
+            CancellationToken cancellationToken) =>
+        {
+            var sequenceNumber = await broker.ScheduleMessageAsync(
+                Resolve(name, subscription), ToEnvelope(request.Message), request.DueAt, cancellationToken);
+
+            return Results.Ok(new { sequenceNumber });
+        });
+
+        group.MapDelete("/messages/schedule/{sequenceNumber}", async (
+            string name,
+            string? subscription,
+            ulong sequenceNumber,
+            BrokerService broker,
+            CancellationToken cancellationToken) =>
+            await broker.CancelScheduledMessageAsync(Resolve(name, subscription), sequenceNumber, cancellationToken)
+                ? Results.NoContent()
+                : Results.NotFound());
+
+        group.MapPost("/messages/receivedeferred", async (
+            string name,
+            string? subscription,
+            ReceiveDeferredRequestDto request,
+            BrokerService broker,
+            CancellationToken cancellationToken) =>
+        {
+            var messages = await broker.ReceiveDeferredAsync(
+                Resolve(name, subscription),
+                request.SequenceNumbers,
+                request.ReceiverId ?? "http",
+                cancellationToken);
+
+            return Results.Ok(messages.Select(ToDto));
+        });
+
+        group.MapPost("/messages/settle", async (
+            string name,
+            string? subscription,
+            BatchSettleRequestDto request,
+            BrokerService broker,
+            CancellationToken cancellationToken) =>
+        {
+            var action = Enum.TryParse<SettleAction>($"{request.Action}", ignoreCase: true, out var parsed)
+                ? parsed
+                : throw DistMqException.Invalid($"'{request.Action}' is not a valid settle action.");
+
+            var results = await broker.SettleAsync(
+                Resolve(name, subscription),
+                action,
+                request.Settlements.Select(settlement => new Settlement
+                {
+                    SequenceNumber = settlement.SequenceNumber,
+                    LockToken = settlement.LockToken ?? string.Empty,
+                    DeadLetterReason = settlement.Reason ?? string.Empty,
+                    DeadLetterDescription = settlement.Description ?? string.Empty,
+                }).ToList(),
+                cancellationToken);
+
+            return Results.Ok(results.Select(result => new
+            {
+                sequenceNumber = result.SequenceNumber,
+                settled = result.Settled,
+                error = result.Error,
+            }));
+        });
 
         group.MapPost("/messages/renewlock", async (
             string name,

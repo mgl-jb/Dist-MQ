@@ -53,12 +53,25 @@ public static class BrokerServiceCollectionExtensions
             provider.GetRequiredService<ITableStore>(),
             provider.GetRequiredService<BrokerOptions>().Namespace));
 
+        services.AddSingleton(provider => new ScheduledStore(
+            provider.GetRequiredService<ITableStore>(),
+            provider.GetRequiredService<TimeProvider>()));
+
+        services.AddSingleton(provider => new DeduplicationStore(provider.GetRequiredService<ITableStore>()));
+        services.AddSingleton(provider => new DeferredStore(provider.GetRequiredService<ITableStore>()));
+
         services.AddSingleton(provider => new PartitionRegistry(
             provider.GetRequiredService<EntityStore>(),
             provider.GetRequiredService<IObjectStore>(),
-            provider.GetRequiredService<TimeProvider>()));
+            provider.GetRequiredService<TimeProvider>(),
+            provider.GetRequiredService<DeferredStore>()));
 
-        services.AddSingleton<BrokerService>();
+        services.AddSingleton(provider => new BrokerService(
+            provider.GetRequiredService<EntityStore>(),
+            provider.GetRequiredService<PartitionRegistry>(),
+            provider.GetRequiredService<ScheduledStore>(),
+            provider.GetRequiredService<DeduplicationStore>(),
+            provider.GetRequiredService<TimeProvider>()));
         services.AddHostedService(provider => new MaintenanceWorker(
             provider.GetRequiredService<BrokerService>(),
             provider.GetRequiredService<ILogger<MaintenanceWorker>>(),

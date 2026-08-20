@@ -35,6 +35,7 @@ public sealed class PartitionProcessor
     private readonly IObjectStore _objects;
     private readonly TimeProvider _time;
     private readonly Func<EntityPath, IReadOnlyList<MessageEnvelope>, CancellationToken, Task> _deadLetterSink;
+    private readonly DeferredStore? _deferredStore;
 
     private EntityDescriptor _entity;
     private ulong _nextLocalSequence;
@@ -48,11 +49,13 @@ public sealed class PartitionProcessor
         PartitionLog log,
         IObjectStore objects,
         Func<EntityPath, IReadOnlyList<MessageEnvelope>, CancellationToken, Task> deadLetterSink,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        DeferredStore? deferredStore = null)
     {
         _entity = entity;
         _objects = objects;
         _deadLetterSink = deadLetterSink;
+        _deferredStore = deferredStore;
         _time = timeProvider ?? TimeProvider.System;
 
         PartitionId = partitionId;
@@ -436,6 +439,8 @@ public sealed class PartitionProcessor
             var results = new List<SettlementResult>(settlements.Count);
             var deadLettered = new List<MessageEnvelope>();
             var spent = new List<ulong>();
+            var deferredIndexWrites = new List<(ulong SequenceNumber, LockedMessage Message)>();
+            var deferredIndexDeletes = new List<ulong>();
 
             foreach (var settlement in settlements)
             {
@@ -443,6 +448,7 @@ public sealed class PartitionProcessor
                 {
                     case SettleAction.Complete:
                     {
+                        var wasDeferred = consumer.State.IsDeferred(settlement.SequenceNumber);
                         var result = consumer.State.Complete(settlement.SequenceNumber, settlement.LockToken, now);
                         results.Add(Record(settlement, result));
                         if (result == SettleResult.Ok)
@@ -453,6 +459,11 @@ public sealed class PartitionProcessor
                                 Consumer = consumerName,
                                 LockToken = settlement.LockToken,
                             }));
+
+                            if (wasDeferred)
+                            {
+                                deferredIndexDeletes.Add(settlement.SequenceNumber);
+                            }
                         }
 
                         break;
@@ -487,6 +498,7 @@ public sealed class PartitionProcessor
 
                     case SettleAction.DeadLetter:
                     {
+                        var wasDeferredForDeadLetter = consumer.State.IsDeferred(settlement.SequenceNumber);
                         var outcome = consumer.State.DeadLetter(
                             settlement.SequenceNumber,
                             settlement.LockToken,
@@ -512,11 +524,19 @@ public sealed class PartitionProcessor
                             Description = outcome.Message.DeadLetterDescription,
                         }));
 
+                        if (wasDeferredForDeadLetter)
+                        {
+                            deferredIndexDeletes.Add(settlement.SequenceNumber);
+                        }
+
                         break;
                     }
 
                     case SettleAction.Defer:
                     {
+                        var deferring = consumer.State.Peek(settlement.SequenceNumber, 1)
+                            .FirstOrDefault(message => message.SequenceNumber == settlement.SequenceNumber);
+
                         var result = consumer.State.Defer(settlement.SequenceNumber, settlement.LockToken, now);
                         results.Add(Record(settlement, result));
                         if (result == SettleResult.Ok)
@@ -527,6 +547,11 @@ public sealed class PartitionProcessor
                                 Consumer = consumerName,
                                 LockToken = settlement.LockToken,
                             }));
+
+                            if (_deferredStore is not null && deferring is not null)
+                            {
+                                deferredIndexWrites.Add((settlement.SequenceNumber, deferring));
+                            }
                         }
 
                         break;
@@ -548,6 +573,20 @@ public sealed class PartitionProcessor
                 _recordsSinceSnapshot += entries.Count;
             }
 
+            if (_deferredStore is not null)
+            {
+                foreach (var (sequenceNumber, message) in deferredIndexWrites)
+                {
+                    await _deferredStore.RememberAsync(
+                        _entity.Path, consumerName, sequenceNumber, message.DeliveryCount, message.Message, cancellationToken);
+                }
+
+                foreach (var sequenceNumber in deferredIndexDeletes)
+                {
+                    await _deferredStore.ForgetAsync(_entity.Path, consumerName, sequenceNumber, cancellationToken);
+                }
+            }
+
             if (deadLettered.Count > 0)
             {
                 await _deadLetterSink(consumer.Descriptor.Path.DeadLetter(), deadLettered, cancellationToken);
@@ -560,6 +599,73 @@ public sealed class PartitionProcessor
 
             await MaybeSnapshotAsync(cancellationToken);
             return results;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Locks previously deferred messages, addressed by sequence number. Falls back to the
+    /// deferred index when the message is no longer in memory — which is the normal case
+    /// after a restart, since deferral lets the cursor move past it.
+    /// </summary>
+    public async Task<IReadOnlyList<LockedMessage>> ReceiveDeferredAsync(
+        string consumerName,
+        IReadOnlyList<ulong> sequenceNumbers,
+        string receiverId,
+        CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            var consumer = Consumer(consumerName);
+            var now = _time.GetUtcNow();
+            var locked = new List<LockedMessage>(sequenceNumbers.Count);
+            var entries = new List<LogEntry>();
+
+            foreach (var sequenceNumber in sequenceNumbers)
+            {
+                if (!consumer.State.IsDeferred(sequenceNumber) && _deferredStore is not null)
+                {
+                    var stored = await _deferredStore.FindAsync(
+                        _entity.Path, consumerName, sequenceNumber, cancellationToken);
+
+                    if (stored is not null)
+                    {
+                        consumer.State.RestoreDeferred(
+                            stored.SequenceNumber, stored.Message, stored.DeliveryCount, now);
+                    }
+                }
+
+                if (!consumer.State.TryLockDeferred(sequenceNumber, now, receiverId, out var message))
+                {
+                    throw new DistMqException(
+                        DistMqErrorCode.MessageNotDeferred,
+                        $"Message {sequenceNumber} is not deferred on '{_entity.Path.Value}', or is already locked.");
+                }
+
+                entries.Add(new LogEntry(LogRecordType.Lock, new LockRecord
+                {
+                    SequenceNumber = message.SequenceNumber,
+                    Consumer = consumerName,
+                    LockToken = message.LockToken,
+                    LockedUntilTicks = message.LockedUntil.UtcTicks,
+                    DeliveryCount = message.DeliveryCount,
+                    ReceiverId = receiverId,
+                }));
+
+                locked.Add(message with { Message = await ResolvePayloadAsync(message.Message, cancellationToken) });
+            }
+
+            if (entries.Count > 0)
+            {
+                await Log.AppendAsync(entries, cancellationToken);
+                _recordsSinceSnapshot += entries.Count;
+            }
+
+            return locked;
         }
         finally
         {

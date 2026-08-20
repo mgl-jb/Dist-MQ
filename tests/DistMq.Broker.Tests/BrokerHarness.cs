@@ -43,8 +43,9 @@ public sealed class BrokerHarness(IObjectStore objects, ITableStore tables, stri
     private BrokerService Build()
     {
         var entities = new EntityStore(tables, ns);
-        var registry = new PartitionRegistry(entities, objects, Time);
-        return new BrokerService(entities, registry);
+        var registry = new PartitionRegistry(entities, objects, Time, new DeferredStore(tables));
+        return new BrokerService(
+            entities, registry, new ScheduledStore(tables, Time), new DeduplicationStore(tables), Time);
     }
 
     public static MessageEnvelope Message(

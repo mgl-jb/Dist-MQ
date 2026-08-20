@@ -54,3 +54,25 @@ public class AzureTopicScenarios(AzuriteFixture azurite) : TopicScenarios
             (new AzureObjectStore(options), new AzureTableStore(options)));
     }
 }
+
+/// <summary>Scheduling, deferral and deduplication over the in-memory store.</summary>
+public class InMemoryScheduleDeferDedupScenarios : ScheduleDeferDedupScenarios
+{
+    protected override Task<(IObjectStore Objects, ITableStore Tables)> CreateStorageAsync()
+    {
+        var storage = new InMemoryStorage();
+        return Task.FromResult((storage.Objects, storage.Tables));
+    }
+}
+
+/// <summary>The same, over Azurite: these features live almost entirely in table storage.</summary>
+[Collection(AzuriteCollection.Name)]
+public class AzureScheduleDeferDedupScenarios(AzuriteFixture azurite) : ScheduleDeferDedupScenarios
+{
+    protected override Task<(IObjectStore Objects, ITableStore Tables)> CreateStorageAsync()
+    {
+        var options = new AzureStorageOptions { ConnectionString = azurite.ConnectionString };
+        return Task.FromResult<(IObjectStore, ITableStore)>(
+            (new AzureObjectStore(options), new AzureTableStore(options)));
+    }
+}

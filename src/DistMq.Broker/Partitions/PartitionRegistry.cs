@@ -19,7 +19,8 @@ namespace DistMq.Broker.Partitions;
 public sealed class PartitionRegistry(
     EntityStore entities,
     IObjectStore objects,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null,
+    DeferredStore? deferredStore = null)
 {
     private readonly ConcurrentDictionary<string, Lazy<Task<PartitionProcessor[]>>> _partitions =
         new(StringComparer.Ordinal);
@@ -125,7 +126,7 @@ public sealed class PartitionRegistry(
         {
             var log = new PartitionLog(objects, path.Value, partitionId);
             var processor = new PartitionProcessor(
-                descriptor, partitionId, log, objects, DeadLetterAsync, _time);
+                descriptor, partitionId, log, objects, DeadLetterAsync, _time, deferredStore);
 
             foreach (var subscription in subscriptions)
             {

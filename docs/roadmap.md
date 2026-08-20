@@ -17,7 +17,7 @@ suite green and lands its own documentation.
   peek-lock, lock expiry sweeper, TTL, DLQ, recovery from snapshot.
 - [x] **6. Topics, subscriptions, filters** — per-subscription state, correlation
   and SQL-subset filters, rule actions, rule CRUD.
-- [ ] **7. Scheduled, deferred, dedup, batching** — timer worker, deferral index,
+- [x] **7. Scheduled, deferred, dedup, batching** — timer worker, deferral index,
   dedup window and sweeper, batched append/settle, credit-based prefetch.
 - [ ] **8. Sessions** — session locks, per-session FIFO, session state.
 - [ ] **9. Clustering** — membership, leader election, rendezvous assignment,
