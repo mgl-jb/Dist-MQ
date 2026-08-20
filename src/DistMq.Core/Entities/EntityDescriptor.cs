@@ -32,6 +32,12 @@ public sealed record EntityDescriptor
     /// <summary>Move a message to the dead-letter queue when its time-to-live elapses.</summary>
     public bool DeadLetterOnExpiration { get; init; } = true;
 
+    /// <summary>
+    /// Rules for a subscription. A message joins the subscription when any rule matches;
+    /// ignored for queues and topics.
+    /// </summary>
+    public IReadOnlyList<RuleDescriptor> Rules { get; init; } = [RuleDescriptor.Default];
+
     /// <summary>Concurrency token from the entity store; null for an entity not yet persisted.</summary>
     public string? ETag { get; init; }
 
@@ -69,6 +75,18 @@ public sealed record EntityDescriptor
         if (Path.Kind == EntityKind.Topic && RequiresSession)
         {
             throw DistMqException.Invalid("Sessions are configured on subscriptions, not on the topic.");
+        }
+
+        if (Path.Kind == EntityKind.Subscription && Rules.Count == 0)
+        {
+            throw DistMqException.Invalid("A subscription must have at least one rule.");
+        }
+
+        // Parsing here means a malformed filter is rejected when the rule is configured,
+        // rather than silently dropping messages later.
+        foreach (var rule in Rules)
+        {
+            rule.Compile();
         }
     }
 }

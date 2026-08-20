@@ -215,7 +215,23 @@ filter matches. Filters:
   `IS [NOT] NULL`, arithmetic, parentheses, and `EXISTS(prop)`.
 
 Rules may carry a `SqlRuleAction` (`SET prop = expr`, `REMOVE prop`) applied to
-the subscriber's copy of the message properties.
+the subscriber's copy of the message properties — never to the stored message,
+which every subscription shares.
+
+Two consequences of evaluating filters at delivery rather than at publish:
+
+- Changing a subscription's rules affects messages already in the topic that the
+  subscription has not yet been offered. Messages it has already been given
+  remain its responsibility and stay settleable.
+- A subscription created after a message was published does not receive it. Its
+  cursor starts at the log's current end, and that starting point is written to
+  the log as a checkpoint record, so a restart before the next snapshot does not
+  hand it the backlog.
+
+Filter expressions follow SQL-92 three-valued logic: a comparison involving a
+missing property is Unknown, not false, and only a result of exactly True selects
+the message. `NOT (price > 10)` therefore does not match a message with no
+`price` property.
 
 ## Sessions
 

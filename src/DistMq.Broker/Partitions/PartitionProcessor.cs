@@ -2,35 +2,41 @@ using DistMq.Broker.Storage;
 using DistMq.Core;
 using DistMq.Core.Delivery;
 using DistMq.Core.Entities;
+using DistMq.Core.Logs;
 using DistMq.Protocol;
 using DistMq.Storage;
 using Google.Protobuf;
 
 namespace DistMq.Broker.Partitions;
 
-/// <summary>Counts reported for an entity's runtime state.</summary>
+/// <summary>Counts reported for one consumer of a partition.</summary>
 public readonly record struct PartitionCounts(long Active, long Locked, long Deferred, long Scheduled);
 
 /// <summary>
 /// Owns one partition of one entity: allocates sequence numbers, writes the log, and
-/// holds the delivery state.
+/// holds delivery state for every consumer of that partition.
 /// </summary>
 /// <remarks>
+/// A queue has exactly one consumer, keyed by the empty string. A topic has one per
+/// subscription, each with its own cursor, locks, delivery counts and dead-letter queue,
+/// all reading the single copy of the message the publisher appended (ADR 0008) — so
+/// publish cost does not grow with subscriber count.
+///
 /// Every mutating operation runs under one gate. A partition is owned by a single broker
-/// (ADR 0003), so serialising here costs nothing across the cluster and removes a whole
-/// class of interleaving bugs — the log's record order is the state machine's operation
-/// order, which is what makes replay reproduce exactly the state that was lost.
+/// (ADR 0003), so serialising here costs nothing across the cluster and makes the log's
+/// record order the state machine's operation order — which is what lets replay reproduce
+/// exactly the state that was lost.
 /// </remarks>
 public sealed class PartitionProcessor
 {
     private readonly SemaphoreSlim _gate = new(1, 1);
     private readonly AsyncSignal _messageArrived = new();
+    private readonly Dictionary<string, ConsumerContext> _consumers = new(StringComparer.Ordinal);
     private readonly IObjectStore _objects;
     private readonly TimeProvider _time;
     private readonly Func<EntityPath, IReadOnlyList<MessageEnvelope>, CancellationToken, Task> _deadLetterSink;
 
     private EntityDescriptor _entity;
-    private PartitionConsumerState _state;
     private ulong _nextLocalSequence;
     private LogPosition _replayFrom;
     private long _recordsSinceSnapshot;
@@ -51,7 +57,54 @@ public sealed class PartitionProcessor
 
         PartitionId = partitionId;
         Log = log;
-        _state = new PartitionConsumerState(entity);
+
+        // A topic holds no delivery state of its own; its subscriptions are registered
+        // as they are discovered.
+        if (entity.Path.Kind != EntityKind.Topic)
+        {
+            _consumers[string.Empty] = ConsumerContext.For(entity);
+        }
+    }
+
+    private sealed record ConsumerContext(
+        string Name,
+        EntityDescriptor Descriptor,
+        PartitionConsumerState State,
+        IReadOnlyList<CompiledRule> Rules)
+    {
+        public static ConsumerContext For(EntityDescriptor descriptor, string? name = null) => new(
+            name ?? string.Empty,
+            descriptor,
+            new PartitionConsumerState(descriptor, name ?? string.Empty),
+            descriptor.Path.Kind == EntityKind.Subscription
+                ? descriptor.Rules.Select(rule => rule.Compile()).ToList()
+                : []);
+
+        /// <summary>
+        /// Whether the message belongs to this consumer, and the copy it should see. A rule
+        /// action applies to the subscriber's copy only — the stored message is shared.
+        /// </summary>
+        public bool TryProject(MessageEnvelope message, out MessageEnvelope projected)
+        {
+            projected = message;
+            if (Rules.Count == 0)
+            {
+                return true;
+            }
+
+            foreach (var rule in Rules)
+            {
+                if (!rule.Filter.Matches(message))
+                {
+                    continue;
+                }
+
+                projected = rule.Action is null ? message : rule.Action.Apply(message);
+                return true;
+            }
+
+            return false;
+        }
     }
 
     /// <summary>Records written before a snapshot is taken.</summary>
@@ -79,7 +132,6 @@ public sealed class PartitionProcessor
             }
 
             await Log.InitializeAsync(cancellationToken);
-            _state = new PartitionConsumerState(_entity);
             _replayFrom = new LogPosition(0, 0);
 
             var snapshot = await Log.ReadLatestSnapshotAsync(cancellationToken);
@@ -88,19 +140,16 @@ public sealed class PartitionProcessor
                 _replayFrom = new LogPosition(snapshot.SegmentIndex, (long)snapshot.LogOffset);
                 _nextLocalSequence = snapshot.NextSequenceNumber;
 
-                var consumer = snapshot.Consumers.FirstOrDefault();
-                if (consumer is not null)
+                foreach (var consumerSnapshot in snapshot.Consumers)
                 {
-                    _state.RestoreCursor(consumer.Frontier, consumer.Gaps);
+                    if (_consumers.TryGetValue(consumerSnapshot.Consumer, out var consumer))
+                    {
+                        consumer.State.RestoreCursor(consumerSnapshot.Frontier, consumerSnapshot.Gaps);
+                    }
                 }
             }
 
-            var now = _time.GetUtcNow();
-            await foreach (var record in Log.ReadFromAsync(_replayFrom, cancellationToken))
-            {
-                Apply(record.Frame, now);
-            }
-
+            await ReplayAsync(cancellationToken);
             _recovered = true;
         }
         finally
@@ -108,6 +157,143 @@ public sealed class PartitionProcessor
             _gate.Release();
         }
     }
+
+    /// <summary>
+    /// Adds a known subscription before recovery runs.
+    /// </summary>
+    /// <remarks>
+    /// Attaching must happen before replay, not after: replay delivers each appended
+    /// message to the consumers that exist at that moment, so a subscription attached
+    /// afterwards would come up empty. Its starting point comes from the checkpoint
+    /// record replay finds in the log, so nothing is assumed here.
+    /// </remarks>
+    public void AttachConsumer(EntityDescriptor subscription)
+    {
+        var name = subscription.Path.Name;
+        if (!_consumers.ContainsKey(name))
+        {
+            _consumers[name] = ConsumerContext.For(subscription, name);
+        }
+    }
+
+    /// <summary>
+    /// Adds a newly created subscription.
+    /// </summary>
+    /// <remarks>
+    /// A subscription created after messages were published must not drain the topic's
+    /// backlog, so its cursor starts at the log's current end. That starting point is
+    /// written to the log as a checkpoint rather than only held in memory — otherwise a
+    /// restart before the next snapshot would hand the new subscription every old message.
+    /// </remarks>
+    public async Task RegisterConsumerAsync(EntityDescriptor subscription, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            var name = subscription.Path.Name;
+            if (_consumers.ContainsKey(name))
+            {
+                return;
+            }
+
+            var consumer = ConsumerContext.For(subscription, name);
+            _consumers[name] = consumer;
+
+            var startAt = SequenceNumber.Pack(PartitionId, _nextLocalSequence);
+            consumer.State.SkipTo(startAt);
+
+            await Log.AppendAsync(
+                [
+                    new LogEntry(LogRecordType.Checkpoint, new CheckpointRecord
+                    {
+                        Consumer = name,
+                        Frontier = startAt,
+                        WrittenTicks = _time.GetUtcNow().UtcTicks,
+                    }),
+                ],
+                cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Attaches a subscription this broker did not know about — created elsewhere while
+    /// the topic was already loaded — and rebuilds its state by replaying the log.
+    /// </summary>
+    /// <remarks>
+    /// Replay is idempotent (an already-tracked message is not re-added, a settled one
+    /// stays settled, a delivery count only ever rises), so replaying over live consumers
+    /// is safe.
+    /// </remarks>
+    public async Task EnsureConsumerAsync(EntityDescriptor subscription, CancellationToken cancellationToken = default)
+    {
+        if (_consumers.ContainsKey(subscription.Path.Name))
+        {
+            return;
+        }
+
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            if (_consumers.ContainsKey(subscription.Path.Name))
+            {
+                return;
+            }
+
+            AttachConsumer(subscription);
+            await ReplayAsync(cancellationToken);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Replaces a subscription's configuration, keeping its delivery state. Used when rules
+    /// change: the cursor, locks and delivery counts belong to the subscription, not to the
+    /// rules, so recreating them would redeliver everything in flight.
+    /// </summary>
+    public async Task UpdateConsumerAsync(EntityDescriptor subscription, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            var name = subscription.Path.Name;
+            if (!_consumers.TryGetValue(name, out var existing))
+            {
+                return;
+            }
+
+            _consumers[name] = existing with
+            {
+                Descriptor = subscription,
+                Rules = subscription.Rules.Select(rule => rule.Compile()).ToList(),
+            };
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public async Task RemoveConsumerAsync(string name, CancellationToken cancellationToken = default)
+    {
+        await _gate.WaitAsync(cancellationToken);
+        try
+        {
+            _consumers.Remove(name);
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    public bool HasConsumer(string name) => _consumers.ContainsKey(name);
 
     public async Task<IReadOnlyList<ulong>> SendAsync(
         IReadOnlyList<MessageEnvelope> messages,
@@ -142,12 +328,12 @@ public sealed class PartitionProcessor
             }
 
             // Durable before acknowledged: the send is not reported as accepted until the
-            // log append has landed in storage.
+            // append has landed in storage.
             await Log.AppendAsync(entries, cancellationToken);
 
             foreach (var record in records)
             {
-                _state.Append(record.SequenceNumber, record.Message, now);
+                Deliver(record.SequenceNumber, record.Message, now);
             }
 
             _recordsSinceSnapshot += entries.Count;
@@ -161,6 +347,7 @@ public sealed class PartitionProcessor
     }
 
     public async Task<IReadOnlyList<LockedMessage>> ReceiveAsync(
+        string consumerName,
         int maxMessages,
         ReceiveMode mode,
         string receiverId,
@@ -169,15 +356,17 @@ public sealed class PartitionProcessor
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            var consumer = Consumer(consumerName);
             var now = _time.GetUtcNow();
             var locked = new List<LockedMessage>(maxMessages);
             var entries = new List<LogEntry>();
 
-            while (locked.Count < maxMessages && _state.TryLock(now, receiverId, out var message))
+            while (locked.Count < maxMessages && consumer.State.TryLock(now, receiverId, out var message))
             {
                 entries.Add(new LogEntry(LogRecordType.Lock, new LockRecord
                 {
                     SequenceNumber = message.SequenceNumber,
+                    Consumer = consumerName,
                     LockToken = message.LockToken,
                     LockedUntilTicks = message.LockedUntil.UtcTicks,
                     DeliveryCount = message.DeliveryCount,
@@ -194,13 +383,14 @@ public sealed class PartitionProcessor
 
             if (mode == ReceiveMode.ReceiveAndDelete)
             {
-                // Settled as it is delivered. Faster, and lost if the client dies —
-                // which is the trade the caller asked for by choosing this mode.
+                // Settled as it is delivered. Faster, and lost if the client dies — which
+                // is the trade the caller asked for by choosing this mode.
                 foreach (var message in locked)
                 {
                     entries.Add(new LogEntry(LogRecordType.Complete, new CompleteRecord
                     {
                         SequenceNumber = message.SequenceNumber,
+                        Consumer = consumerName,
                         LockToken = message.LockToken,
                     }));
                 }
@@ -213,7 +403,7 @@ public sealed class PartitionProcessor
             {
                 foreach (var message in locked)
                 {
-                    _state.Complete(message.SequenceNumber, message.LockToken, now);
+                    consumer.State.Complete(message.SequenceNumber, message.LockToken, now);
                 }
             }
 
@@ -231,35 +421,8 @@ public sealed class PartitionProcessor
         }
     }
 
-    /// <summary>Waits up to <paramref name="maxWait"/> for a message rather than returning empty immediately.</summary>
-    public async Task<IReadOnlyList<LockedMessage>> ReceiveWithWaitAsync(
-        int maxMessages,
-        ReceiveMode mode,
-        string receiverId,
-        TimeSpan maxWait,
-        CancellationToken cancellationToken = default)
-    {
-        var deadline = _time.GetUtcNow() + maxWait;
-
-        while (true)
-        {
-            var received = await ReceiveAsync(maxMessages, mode, receiverId, cancellationToken);
-            if (received.Count > 0)
-            {
-                return received;
-            }
-
-            var remaining = deadline - _time.GetUtcNow();
-            if (remaining <= TimeSpan.Zero)
-            {
-                return [];
-            }
-
-            await _messageArrived.WaitAsync(remaining, cancellationToken);
-        }
-    }
-
     public async Task<IReadOnlyList<SettlementResult>> SettleAsync(
+        string consumerName,
         SettleAction action,
         IReadOnlyList<Settlement> settlements,
         CancellationToken cancellationToken = default)
@@ -267,33 +430,39 @@ public sealed class PartitionProcessor
         await _gate.WaitAsync(cancellationToken);
         try
         {
+            var consumer = Consumer(consumerName);
             var now = _time.GetUtcNow();
             var entries = new List<LogEntry>(settlements.Count);
             var results = new List<SettlementResult>(settlements.Count);
             var deadLettered = new List<MessageEnvelope>();
-            var abandonedAndSpent = new List<Settlement>();
+            var spent = new List<ulong>();
 
             foreach (var settlement in settlements)
             {
                 switch (action)
                 {
                     case SettleAction.Complete:
-                        results.Add(Record(settlement, _state.Complete(settlement.SequenceNumber, settlement.LockToken, now)));
-                        if (results[^1].Settled)
+                    {
+                        var result = consumer.State.Complete(settlement.SequenceNumber, settlement.LockToken, now);
+                        results.Add(Record(settlement, result));
+                        if (result == SettleResult.Ok)
                         {
                             entries.Add(new LogEntry(LogRecordType.Complete, new CompleteRecord
                             {
                                 SequenceNumber = settlement.SequenceNumber,
+                                Consumer = consumerName,
                                 LockToken = settlement.LockToken,
                             }));
                         }
 
                         break;
+                    }
 
                     case SettleAction.Abandon:
                     {
-                        var outcome = _state.Abandon(
+                        var outcome = consumer.State.Abandon(
                             settlement.SequenceNumber, settlement.LockToken, now, settlement.ModifiedProperties);
+
                         results.Add(Record(settlement, outcome.Result));
                         if (outcome.Result != SettleResult.Ok)
                         {
@@ -303,13 +472,14 @@ public sealed class PartitionProcessor
                         entries.Add(new LogEntry(LogRecordType.Abandon, new AbandonRecord
                         {
                             SequenceNumber = settlement.SequenceNumber,
+                            Consumer = consumerName,
                             LockToken = settlement.LockToken,
                             DeliveryCount = outcome.DeliveryCount,
                         }));
 
                         if (outcome.ShouldDeadLetter)
                         {
-                            abandonedAndSpent.Add(settlement);
+                            spent.Add(settlement.SequenceNumber);
                         }
 
                         break;
@@ -317,7 +487,7 @@ public sealed class PartitionProcessor
 
                     case SettleAction.DeadLetter:
                     {
-                        var outcome = _state.DeadLetter(
+                        var outcome = consumer.State.DeadLetter(
                             settlement.SequenceNumber,
                             settlement.LockToken,
                             now,
@@ -336,6 +506,7 @@ public sealed class PartitionProcessor
                         entries.Add(new LogEntry(LogRecordType.DeadLetter, new DeadLetterRecord
                         {
                             SequenceNumber = settlement.SequenceNumber,
+                            Consumer = consumerName,
                             LockToken = settlement.LockToken,
                             Reason = outcome.Message!.DeadLetterReason,
                             Description = outcome.Message.DeadLetterDescription,
@@ -345,39 +516,30 @@ public sealed class PartitionProcessor
                     }
 
                     case SettleAction.Defer:
-                        results.Add(Record(settlement, _state.Defer(settlement.SequenceNumber, settlement.LockToken, now)));
-                        if (results[^1].Settled)
+                    {
+                        var result = consumer.State.Defer(settlement.SequenceNumber, settlement.LockToken, now);
+                        results.Add(Record(settlement, result));
+                        if (result == SettleResult.Ok)
                         {
                             entries.Add(new LogEntry(LogRecordType.Defer, new DeferRecord
                             {
                                 SequenceNumber = settlement.SequenceNumber,
+                                Consumer = consumerName,
                                 LockToken = settlement.LockToken,
                             }));
                         }
 
                         break;
+                    }
 
                     default:
                         throw DistMqException.Invalid($"Unsupported settle action '{action}'.");
                 }
             }
 
-            foreach (var settlement in abandonedAndSpent)
+            foreach (var sequenceNumber in spent)
             {
-                var outcome = _state.DeadLetterUnlocked(
-                    settlement.SequenceNumber,
-                    DeadLetterReason.MaxDeliveryCountExceeded,
-                    $"Delivery attempts exceeded {_entity.MaxDeliveryCount}.");
-
-                if (outcome.Message is not null)
-                {
-                    deadLettered.Add(outcome.Message);
-                    entries.Add(new LogEntry(LogRecordType.DeadLetter, new DeadLetterRecord
-                    {
-                        SequenceNumber = settlement.SequenceNumber,
-                        Reason = DeadLetterReason.MaxDeliveryCountExceeded,
-                    }));
-                }
+                DeadLetterSpent(consumer, sequenceNumber, entries, deadLettered);
             }
 
             if (entries.Count > 0)
@@ -388,10 +550,10 @@ public sealed class PartitionProcessor
 
             if (deadLettered.Count > 0)
             {
-                await _deadLetterSink(_entity.Path.DeadLetter(), deadLettered, cancellationToken);
+                await _deadLetterSink(consumer.Descriptor.Path.DeadLetter(), deadLettered, cancellationToken);
             }
 
-            if (settlements.Count > 0 && results.Any(result => result.Settled))
+            if (results.Any(result => result.Settled))
             {
                 _messageArrived.Set();
             }
@@ -406,6 +568,7 @@ public sealed class PartitionProcessor
     }
 
     public async Task<DateTimeOffset> RenewLockAsync(
+        string consumerName,
         ulong sequenceNumber,
         string lockToken,
         CancellationToken cancellationToken = default)
@@ -413,7 +576,7 @@ public sealed class PartitionProcessor
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            return _state.RenewLock(sequenceNumber, lockToken, _time.GetUtcNow());
+            return Consumer(consumerName).State.RenewLock(sequenceNumber, lockToken, _time.GetUtcNow());
         }
         finally
         {
@@ -422,6 +585,7 @@ public sealed class PartitionProcessor
     }
 
     public async Task<IReadOnlyList<LockedMessage>> PeekAsync(
+        string consumerName,
         ulong fromSequenceNumber,
         int maxMessages,
         CancellationToken cancellationToken = default)
@@ -429,7 +593,7 @@ public sealed class PartitionProcessor
         await _gate.WaitAsync(cancellationToken);
         try
         {
-            var peeked = _state.Peek(fromSequenceNumber, maxMessages);
+            var peeked = Consumer(consumerName).State.Peek(fromSequenceNumber, maxMessages);
             var resolved = new List<LockedMessage>(peeked.Count);
             foreach (var message in peeked)
             {
@@ -446,7 +610,7 @@ public sealed class PartitionProcessor
 
     /// <summary>
     /// Returns expired locks to the available set and dead-letters what has run out of
-    /// time or attempts. Runs on a timer on the owning broker.
+    /// time or attempts, for every consumer of this partition.
     /// </summary>
     public async Task SweepAsync(CancellationToken cancellationToken = default)
     {
@@ -455,61 +619,58 @@ public sealed class PartitionProcessor
         {
             var now = _time.GetUtcNow();
             var entries = new List<LogEntry>();
-            var deadLettered = new List<MessageEnvelope>();
+            var deadLetters = new List<(EntityPath Path, MessageEnvelope Message)>();
 
-            foreach (var expired in _state.ExpireLocks(now))
+            foreach (var consumer in _consumers.Values)
             {
-                entries.Add(new LogEntry(LogRecordType.Abandon, new AbandonRecord
+                foreach (var expired in consumer.State.ExpireLocks(now))
                 {
-                    SequenceNumber = expired.SequenceNumber,
-                    DeliveryCount = expired.DeliveryCount,
-                }));
-
-                if (!expired.ShouldDeadLetter)
-                {
-                    continue;
-                }
-
-                var outcome = _state.DeadLetterUnlocked(
-                    expired.SequenceNumber,
-                    DeadLetterReason.MaxDeliveryCountExceeded,
-                    $"Delivery attempts exceeded {_entity.MaxDeliveryCount}.");
-
-                if (outcome.Message is not null)
-                {
-                    deadLettered.Add(outcome.Message);
-                    entries.Add(new LogEntry(LogRecordType.DeadLetter, new DeadLetterRecord
+                    entries.Add(new LogEntry(LogRecordType.Abandon, new AbandonRecord
                     {
                         SequenceNumber = expired.SequenceNumber,
-                        Reason = DeadLetterReason.MaxDeliveryCountExceeded,
+                        Consumer = consumer.Name,
+                        DeliveryCount = expired.DeliveryCount,
                     }));
-                }
-            }
 
-            foreach (var expired in _state.FindExpired(now))
-            {
-                if (_entity.DeadLetterOnExpiration)
-                {
-                    var outcome = _state.DeadLetterUnlocked(
-                        expired.SequenceNumber, DeadLetterReason.TimeToLiveExpired, "The message expired.");
-
-                    if (outcome.Message is not null)
+                    if (!expired.ShouldDeadLetter)
                     {
-                        deadLettered.Add(outcome.Message);
+                        continue;
+                    }
+
+                    var spent = new List<MessageEnvelope>();
+                    DeadLetterSpent(consumer, expired.SequenceNumber, entries, spent);
+                    deadLetters.AddRange(spent.Select(message => (consumer.Descriptor.Path.DeadLetter(), message)));
+                }
+
+                foreach (var expired in consumer.State.FindExpired(now))
+                {
+                    if (consumer.Descriptor.DeadLetterOnExpiration)
+                    {
+                        var outcome = consumer.State.DeadLetterUnlocked(
+                            expired.SequenceNumber, DeadLetterReason.TimeToLiveExpired, "The message expired.");
+
+                        if (outcome.Message is null)
+                        {
+                            continue;
+                        }
+
+                        deadLetters.Add((consumer.Descriptor.Path.DeadLetter(), outcome.Message));
                         entries.Add(new LogEntry(LogRecordType.DeadLetter, new DeadLetterRecord
                         {
                             SequenceNumber = expired.SequenceNumber,
+                            Consumer = consumer.Name,
                             Reason = DeadLetterReason.TimeToLiveExpired,
                         }));
                     }
-                }
-                else
-                {
-                    _state.Discard(expired.SequenceNumber);
-                    entries.Add(new LogEntry(LogRecordType.Expire, new ExpireRecord
+                    else
                     {
-                        SequenceNumber = expired.SequenceNumber,
-                    }));
+                        consumer.State.Discard(expired.SequenceNumber);
+                        entries.Add(new LogEntry(LogRecordType.Expire, new ExpireRecord
+                        {
+                            SequenceNumber = expired.SequenceNumber,
+                            Consumer = consumer.Name,
+                        }));
+                    }
                 }
             }
 
@@ -521,9 +682,10 @@ public sealed class PartitionProcessor
             await Log.AppendAsync(entries, cancellationToken);
             _recordsSinceSnapshot += entries.Count;
 
-            if (deadLettered.Count > 0)
+            foreach (var group in deadLetters.GroupBy(item => item.Path.Value))
             {
-                await _deadLetterSink(_entity.Path.DeadLetter(), deadLettered, cancellationToken);
+                await _deadLetterSink(
+                    group.First().Path, group.Select(item => item.Message).ToList(), cancellationToken);
             }
 
             _messageArrived.Set();
@@ -535,11 +697,19 @@ public sealed class PartitionProcessor
         }
     }
 
-    public PartitionCounts GetCounts() => new(
-        _state.AvailableCount,
-        _state.LockedCount,
-        _state.DeferredCount,
-        Scheduled: 0);
+    public PartitionCounts GetCounts(string consumerName = "")
+    {
+        if (!_consumers.TryGetValue(consumerName, out var consumer))
+        {
+            return default;
+        }
+
+        return new PartitionCounts(
+            consumer.State.AvailableCount,
+            consumer.State.LockedCount,
+            consumer.State.DeferredCount,
+            Scheduled: 0);
+    }
 
     /// <summary>Writes a snapshot so recovery does not have to replay the whole log.</summary>
     public async Task SnapshotAsync(CancellationToken cancellationToken = default)
@@ -555,16 +725,64 @@ public sealed class PartitionProcessor
         }
     }
 
-    internal void UpdateDescriptor(EntityDescriptor entity) => _entity = entity;
+    private ConsumerContext Consumer(string name) =>
+        _consumers.TryGetValue(name, out var consumer)
+            ? consumer
+            : throw DistMqException.NotFound(
+                name.Length == 0 ? _entity.Path.Value : $"{_entity.Path.Value}/subscriptions/{name}");
 
-    private async Task MaybeSnapshotAsync(CancellationToken cancellationToken)
+    /// <summary>Feeds a message to every consumer whose rules accept it.</summary>
+    private void Deliver(ulong sequenceNumber, MessageEnvelope message, DateTimeOffset now)
     {
-        if (_recordsSinceSnapshot < SnapshotInterval)
+        foreach (var consumer in _consumers.Values)
+        {
+            if (consumer.TryProject(message, out var projected))
+            {
+                consumer.State.Append(sequenceNumber, projected, now);
+            }
+        }
+    }
+
+    private void DeadLetterSpent(
+        ConsumerContext consumer,
+        ulong sequenceNumber,
+        List<LogEntry> entries,
+        List<MessageEnvelope> deadLettered)
+    {
+        var outcome = consumer.State.DeadLetterUnlocked(
+            sequenceNumber,
+            DeadLetterReason.MaxDeliveryCountExceeded,
+            $"Delivery attempts exceeded {consumer.Descriptor.MaxDeliveryCount}.");
+
+        if (outcome.Message is null)
         {
             return;
         }
 
-        await WriteSnapshotAsync(cancellationToken);
+        deadLettered.Add(outcome.Message);
+        entries.Add(new LogEntry(LogRecordType.DeadLetter, new DeadLetterRecord
+        {
+            SequenceNumber = sequenceNumber,
+            Consumer = consumer.Name,
+            Reason = DeadLetterReason.MaxDeliveryCountExceeded,
+        }));
+    }
+
+    private async Task ReplayAsync(CancellationToken cancellationToken)
+    {
+        var now = _time.GetUtcNow();
+        await foreach (var record in Log.ReadFromAsync(_replayFrom, cancellationToken))
+        {
+            Apply(record.Frame, now);
+        }
+    }
+
+    private async Task MaybeSnapshotAsync(CancellationToken cancellationToken)
+    {
+        if (_recordsSinceSnapshot >= SnapshotInterval)
+        {
+            await WriteSnapshotAsync(cancellationToken);
+        }
     }
 
     private async Task WriteSnapshotAsync(CancellationToken cancellationToken)
@@ -580,14 +798,22 @@ public sealed class PartitionProcessor
             WrittenTicks = _time.GetUtcNow().UtcTicks,
         };
 
-        var consumer = new ConsumerSnapshot { Consumer = string.Empty, Frontier = _state.Frontier };
-        consumer.Gaps.AddRange(_state.Gaps);
-        foreach (var (sequenceNumber, deliveryCount) in _state.DeliveryCounts)
+        foreach (var consumer in _consumers.Values)
         {
-            consumer.DeliveryCounts[sequenceNumber] = deliveryCount;
-        }
+            var consumerSnapshot = new ConsumerSnapshot
+            {
+                Consumer = consumer.Name,
+                Frontier = consumer.State.Frontier,
+            };
 
-        snapshot.Consumers.Add(consumer);
+            consumerSnapshot.Gaps.AddRange(consumer.State.Gaps);
+            foreach (var (sequenceNumber, deliveryCount) in consumer.State.DeliveryCounts)
+            {
+                consumerSnapshot.DeliveryCounts[sequenceNumber] = deliveryCount;
+            }
+
+            snapshot.Consumers.Add(consumerSnapshot);
+        }
 
         await Log.WriteSnapshotAsync(snapshot, cancellationToken);
         await Log.PruneSnapshotsAsync(cancellationToken: cancellationToken);
@@ -595,14 +821,15 @@ public sealed class PartitionProcessor
     }
 
     /// <summary>Applies one replayed record. Replay reproduces recorded outcomes; it does not re-decide them.</summary>
-    private void Apply(Core.Logs.LogFrame frame, DateTimeOffset now)
+    private void Apply(LogFrame frame, DateTimeOffset now)
     {
         switch (frame.Type)
         {
             case LogRecordType.Append:
             {
                 var record = AppendRecord.Parser.ParseFrom(frame.Body.Span);
-                _state.Append(record.SequenceNumber, record.Message, now);
+                Deliver(record.SequenceNumber, record.Message, now);
+
                 var local = SequenceNumber.LocalOf(record.SequenceNumber);
                 if (local >= _nextLocalSequence)
                 {
@@ -615,38 +842,68 @@ public sealed class PartitionProcessor
             case LogRecordType.Lock:
             {
                 var record = LockRecord.Parser.ParseFrom(frame.Body.Span);
-                _state.RestoreDeliveryCount(record.SequenceNumber, record.DeliveryCount);
+                ForConsumer(record.Consumer, state =>
+                    state.RestoreDeliveryCount(record.SequenceNumber, record.DeliveryCount));
                 break;
             }
 
             case LogRecordType.Abandon:
             {
                 var record = AbandonRecord.Parser.ParseFrom(frame.Body.Span);
-                _state.RestoreDeliveryCount(record.SequenceNumber, record.DeliveryCount);
+                ForConsumer(record.Consumer, state =>
+                    state.RestoreDeliveryCount(record.SequenceNumber, record.DeliveryCount));
                 break;
             }
 
             case LogRecordType.Complete:
-                _state.MarkSettled(CompleteRecord.Parser.ParseFrom(frame.Body.Span).SequenceNumber);
+            {
+                var record = CompleteRecord.Parser.ParseFrom(frame.Body.Span);
+                ForConsumer(record.Consumer, state => state.MarkSettled(record.SequenceNumber));
                 break;
+            }
 
             case LogRecordType.DeadLetter:
-                _state.MarkSettled(DeadLetterRecord.Parser.ParseFrom(frame.Body.Span).SequenceNumber);
+            {
+                var record = DeadLetterRecord.Parser.ParseFrom(frame.Body.Span);
+                ForConsumer(record.Consumer, state => state.MarkSettled(record.SequenceNumber));
                 break;
+            }
 
             case LogRecordType.Expire:
-                _state.MarkSettled(ExpireRecord.Parser.ParseFrom(frame.Body.Span).SequenceNumber);
+            {
+                var record = ExpireRecord.Parser.ParseFrom(frame.Body.Span);
+                ForConsumer(record.Consumer, state => state.MarkSettled(record.SequenceNumber));
                 break;
+            }
 
             case LogRecordType.Defer:
-                _state.MarkDeferred(DeferRecord.Parser.ParseFrom(frame.Body.Span).SequenceNumber);
+            {
+                var record = DeferRecord.Parser.ParseFrom(frame.Body.Span);
+                ForConsumer(record.Consumer, state => state.MarkDeferred(record.SequenceNumber));
                 break;
+            }
+
+            case LogRecordType.Checkpoint:
+            {
+                // Where a subscription started. Everything published before it belongs to
+                // other subscriptions only.
+                var record = CheckpointRecord.Parser.ParseFrom(frame.Body.Span);
+                ForConsumer(record.Consumer, state => state.SkipTo(record.Frontier));
+                break;
+            }
 
             case LogRecordType.SessionState:
-            case LogRecordType.Checkpoint:
             case LogRecordType.Unspecified:
             default:
                 break;
+        }
+    }
+
+    private void ForConsumer(string name, Action<PartitionConsumerState> apply)
+    {
+        if (_consumers.TryGetValue(name, out var consumer))
+        {
+            apply(consumer.State);
         }
     }
 

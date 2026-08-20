@@ -32,3 +32,25 @@ public class AzureQueueScenarios(AzuriteFixture azurite) : QueueScenarios
             (new AzureObjectStore(options), new AzureTableStore(options)));
     }
 }
+
+/// <summary>Topic semantics over the in-memory store.</summary>
+public class InMemoryTopicScenarios : TopicScenarios
+{
+    protected override Task<(IObjectStore Objects, ITableStore Tables)> CreateStorageAsync()
+    {
+        var storage = new InMemoryStorage();
+        return Task.FromResult((storage.Objects, storage.Tables));
+    }
+}
+
+/// <summary>The same topic semantics over Azurite.</summary>
+[Collection(AzuriteCollection.Name)]
+public class AzureTopicScenarios(AzuriteFixture azurite) : TopicScenarios
+{
+    protected override Task<(IObjectStore Objects, ITableStore Tables)> CreateStorageAsync()
+    {
+        var options = new AzureStorageOptions { ConnectionString = azurite.ConnectionString };
+        return Task.FromResult<(IObjectStore, ITableStore)>(
+            (new AzureObjectStore(options), new AzureTableStore(options)));
+    }
+}

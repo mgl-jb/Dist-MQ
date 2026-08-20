@@ -1,3 +1,4 @@
+using System.Text.Json;
 using DistMq.Core;
 using DistMq.Core.Entities;
 using DistMq.Storage;
@@ -57,6 +58,13 @@ public sealed class EntityStore(ITableStore tables, string ns = "default")
     public Task<bool> DeleteAsync(EntityPath path, CancellationToken cancellationToken = default) =>
         tables.DeleteAsync(StorageNames.EntitiesTable, ns, RowKey(path), cancellationToken: cancellationToken);
 
+    /// <summary>
+    /// Rules are stored as JSON on the subscription row rather than as their own rows: they
+    /// are read as a unit with the subscription and are small enough to sit well inside the
+    /// 1 MiB entity limit.
+    /// </summary>
+    private static readonly JsonSerializerOptions RuleJson = new(JsonSerializerDefaults.Web);
+
     /// <summary>Row keys cannot contain '/', so path separators are encoded.</summary>
     private static string RowKey(EntityPath path) => path.Value.Replace('/', '|');
 
@@ -80,12 +88,20 @@ public sealed class EntityStore(ITableStore tables, string ns = "default")
             entity["DuplicateDetectionWindowTicks"] = window.Ticks;
         }
 
+        if (descriptor.Path.Kind == EntityKind.Subscription)
+        {
+            entity["Rules"] = JsonSerializer.Serialize(descriptor.Rules, RuleJson);
+        }
+
         return entity;
     }
 
     private static EntityDescriptor ToDescriptor(StorageEntity entity)
     {
         var windowTicks = entity.GetInt64("DuplicateDetectionWindowTicks");
+        var rules = entity.GetString("Rules") is { Length: > 0 } json
+            ? JsonSerializer.Deserialize<List<RuleDescriptor>>(json, RuleJson) ?? [RuleDescriptor.Default]
+            : new List<RuleDescriptor> { RuleDescriptor.Default };
 
         return new EntityDescriptor
         {
@@ -97,6 +113,7 @@ public sealed class EntityStore(ITableStore tables, string ns = "default")
             DuplicateDetectionWindow = windowTicks > 0 ? TimeSpan.FromTicks(windowTicks) : null,
             RequiresSession = entity.GetBoolean("RequiresSession"),
             DeadLetterOnExpiration = entity.GetBoolean("DeadLetterOnExpiration"),
+            Rules = rules,
             ETag = entity.ETag,
         };
     }

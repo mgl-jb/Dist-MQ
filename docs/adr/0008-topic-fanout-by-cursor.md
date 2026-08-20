@@ -22,6 +22,11 @@ DLQ, evaluated at delivery time.
   subscriptions cost CPU on the owning broker, mitigated by compiling filters
   once at rule creation.
 - The log cannot be trimmed past the slowest subscription's frontier.
+- Filters are evaluated against the rules in force when the message is offered,
+  not when it was published, so a rule change applies to anything the
+  subscription has not yet been given. A subscription created later starts at the
+  log's end, recorded as a checkpoint record so the starting point survives a
+  restart.
 
 ## Alternatives rejected
 

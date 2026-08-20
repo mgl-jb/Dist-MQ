@@ -26,8 +26,42 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
 {
     public async Task<EntityDescriptor> CreateEntityAsync(
         EntityDescriptor descriptor,
-        CancellationToken cancellationToken = default) =>
-        await entities.CreateAsync(descriptor, cancellationToken);
+        CancellationToken cancellationToken = default)
+    {
+        if (descriptor.Path.Kind == EntityKind.Subscription)
+        {
+            // A subscription inherits the topic's partitioning: it is a consumer of the
+            // topic's log, so it cannot have a partition count of its own (ADR 0008).
+            var topic = await entities.RequireAsync(descriptor.Path.ParentTopic(), cancellationToken);
+            descriptor = descriptor with { PartitionCount = topic.PartitionCount };
+        }
+
+        var created = await entities.CreateAsync(descriptor, cancellationToken);
+
+        if (created.Path.Kind == EntityKind.Subscription)
+        {
+            await partitions.AddSubscriptionAsync(created, cancellationToken);
+        }
+
+        return created;
+    }
+
+    /// <summary>Replaces a subscription's rules, keeping its delivery state.</summary>
+    public async Task<EntityDescriptor> UpdateRulesAsync(
+        EntityPath path,
+        IReadOnlyList<RuleDescriptor> rules,
+        CancellationToken cancellationToken = default)
+    {
+        var subscription = await entities.RequireAsync(path, cancellationToken);
+        var updated = await entities.UpdateAsync(subscription with { Rules = rules }, cancellationToken);
+
+        foreach (var processor in await partitions.GetAsync(path.ParentTopic(), cancellationToken))
+        {
+            await processor.UpdateConsumerAsync(updated, cancellationToken);
+        }
+
+        return updated;
+    }
 
     public Task<EntityDescriptor?> GetEntityAsync(EntityPath path, CancellationToken cancellationToken = default) =>
         entities.GetAsync(path, cancellationToken);
@@ -38,6 +72,12 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
     public async Task<bool> DeleteEntityAsync(EntityPath path, CancellationToken cancellationToken = default)
     {
         var deleted = await entities.DeleteAsync(path, cancellationToken);
+
+        if (path.Kind == EntityKind.Subscription)
+        {
+            await partitions.RemoveSubscriptionAsync(path, cancellationToken);
+        }
+
         partitions.Forget(path);
         return deleted;
     }
@@ -47,10 +87,10 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         CancellationToken cancellationToken = default)
     {
         var descriptor = await entities.RequireAsync(path, cancellationToken);
-        var processors = await partitions.GetAsync(path, cancellationToken);
+        var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
 
         long active = 0, locked = 0, deferred = 0, scheduled = 0;
-        foreach (var counts in processors.Select(processor => processor.GetCounts()))
+        foreach (var counts in processors.Select(processor => processor.GetCounts(consumer)))
         {
             active += counts.Active;
             locked += counts.Locked;
@@ -74,6 +114,12 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         IReadOnlyList<MessageEnvelope> messages,
         CancellationToken cancellationToken = default)
     {
+        if (path.Kind == EntityKind.Subscription && !path.IsDeadLetter)
+        {
+            throw DistMqException.Invalid(
+                $"Messages are published to a topic, not to subscription '{path.Value}'.");
+        }
+
         var descriptor = await entities.RequireAsync(path, cancellationToken);
         foreach (var message in messages)
         {
@@ -132,7 +178,7 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         TimeSpan maxWait,
         CancellationToken cancellationToken = default)
     {
-        var processors = await partitions.GetAsync(path, cancellationToken);
+        var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
         var received = new List<ReceivedMessage>(maxMessages);
         var deadline = DateTimeOffset.UtcNow + maxWait;
 
@@ -148,7 +194,7 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
                 }
 
                 var batch = await processor.ReceiveAsync(
-                    maxMessages - received.Count, mode, receiverId, cancellationToken);
+                    consumer, maxMessages - received.Count, mode, receiverId, cancellationToken);
 
                 received.AddRange(batch.Select(message => ToReceived(message, processor.PartitionId)));
             }
@@ -170,14 +216,15 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         IReadOnlyList<Settlement> settlements,
         CancellationToken cancellationToken = default)
     {
+        var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
         var results = new List<SettlementResult>(settlements.Count);
 
         // The partition id is packed into the sequence number, so settlement routes
         // without a lookup.
         foreach (var group in settlements.GroupBy(settlement => SequenceNumber.PartitionOf(settlement.SequenceNumber)))
         {
-            var processor = await partitions.GetAsync(path, group.Key, cancellationToken);
-            results.AddRange(await processor.SettleAsync(action, group.ToList(), cancellationToken));
+            var processor = Partition(processors, path, group.Key);
+            results.AddRange(await processor.SettleAsync(consumer, action, group.ToList(), cancellationToken));
         }
 
         return results;
@@ -189,10 +236,10 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         string lockToken,
         CancellationToken cancellationToken = default)
     {
-        var processor = await partitions.GetAsync(
-            path, SequenceNumber.PartitionOf(sequenceNumber), cancellationToken);
+        var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
+        var processor = Partition(processors, path, SequenceNumber.PartitionOf(sequenceNumber));
 
-        return await processor.RenewLockAsync(sequenceNumber, lockToken, cancellationToken);
+        return await processor.RenewLockAsync(consumer, sequenceNumber, lockToken, cancellationToken);
     }
 
     public async Task<IReadOnlyList<ReceivedMessage>> PeekAsync(
@@ -201,7 +248,7 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
         int maxMessages,
         CancellationToken cancellationToken = default)
     {
-        var processors = await partitions.GetAsync(path, cancellationToken);
+        var (processors, consumer) = await partitions.ResolveAsync(path, cancellationToken);
         var peeked = new List<ReceivedMessage>(maxMessages);
 
         foreach (var processor in processors)
@@ -211,7 +258,8 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
                 break;
             }
 
-            var batch = await processor.PeekAsync(fromSequenceNumber, maxMessages - peeked.Count, cancellationToken);
+            var batch = await processor.PeekAsync(
+                consumer, fromSequenceNumber, maxMessages - peeked.Count, cancellationToken);
             peeked.AddRange(batch.Select(message => ToReceived(message, processor.PartitionId)));
         }
 
@@ -233,6 +281,17 @@ public sealed class BrokerService(EntityStore entities, PartitionRegistry partit
                 await processor.SweepAsync(cancellationToken);
             }
         }
+    }
+
+    private static PartitionProcessor Partition(PartitionProcessor[] processors, EntityPath path, int partitionId)
+    {
+        if (partitionId < 0 || partitionId >= processors.Length)
+        {
+            throw DistMqException.Invalid(
+                $"Partition {partitionId} is out of range for '{path.Value}', which has {processors.Length}.");
+        }
+
+        return processors[partitionId];
     }
 
     private static ReceivedMessage ToReceived(LockedMessage message, int partitionId) => new()

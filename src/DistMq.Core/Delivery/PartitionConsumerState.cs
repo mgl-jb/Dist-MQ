@@ -388,6 +388,30 @@ public sealed class PartitionConsumerState
     public IReadOnlyDictionary<ulong, uint> DeliveryCounts =>
         _tracked.ToDictionary(pair => pair.Key, pair => pair.Value.DeliveryCount);
 
+    /// <summary>
+    /// Moves the cursor forward, discarding anything below it.
+    /// </summary>
+    /// <remarks>
+    /// This is how a subscription created after messages were already published starts
+    /// empty rather than draining the topic's backlog: its cursor begins at the log's
+    /// current end.
+    /// </remarks>
+    public void SkipTo(ulong sequenceNumber)
+    {
+        foreach (var tracked in _tracked.Keys.Where(key => key < sequenceNumber).ToList())
+        {
+            _tracked.Remove(tracked);
+            _available.Remove(tracked);
+        }
+
+        foreach (var deferred in _deferred.Keys.Where(key => key < sequenceNumber).ToList())
+        {
+            _deferred.Remove(deferred);
+        }
+
+        _settled.SkipTo(sequenceNumber);
+    }
+
     /// <summary>Restores the cursor from a snapshot before replay resumes.</summary>
     public void RestoreCursor(ulong frontier, IEnumerable<GapRange> gaps)
     {

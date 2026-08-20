@@ -45,35 +45,51 @@ public static class DataEndpoints
 {
     public static IEndpointRouteBuilder MapDataEndpoints(this IEndpointRouteBuilder builder)
     {
-        MapQueueMessaging(builder, "/queues/{name}", deadLetter: false);
-        MapQueueMessaging(builder, $"/queues/{{name}}/{EntityPath.DeadLetterSuffix}", deadLetter: true);
+        MapMessaging(builder, "/queues/{name}", (values, _) => EntityPath.Queue(values.Name));
+        MapMessaging(
+            builder,
+            $"/queues/{{name}}/{EntityPath.DeadLetterSuffix}",
+            (values, _) => EntityPath.Queue(values.Name).DeadLetter());
+
+        // Publishing goes to the topic; receiving comes from a subscription.
+        MapMessaging(builder, "/topics/{name}", (values, _) => EntityPath.Topic(values.Name));
+        MapMessaging(
+            builder,
+            "/topics/{name}/subscriptions/{subscription}",
+            (values, subscription) => EntityPath.Subscription(values.Name, subscription!));
+        MapMessaging(
+            builder,
+            $"/topics/{{name}}/subscriptions/{{subscription}}/{EntityPath.DeadLetterSuffix}",
+            (values, subscription) => EntityPath.Subscription(values.Name, subscription!).DeadLetter());
+
         return builder;
     }
 
-    private static void MapQueueMessaging(IEndpointRouteBuilder builder, string prefix, bool deadLetter)
+    private static void MapMessaging(
+        IEndpointRouteBuilder builder,
+        string prefix,
+        Func<(string Name, string? Subscription), string?, EntityPath> resolver)
     {
-        EntityPath Resolve(string name)
-        {
-            var path = EntityPath.Queue(name);
-            return deadLetter ? path.DeadLetter() : path;
-        }
+        EntityPath Resolve(string name, string? subscription = null) => resolver((name, subscription), subscription);
 
         var group = builder.MapGroup(prefix).WithTags("messaging");
 
         group.MapPost("/messages", async (
             string name,
+            string? subscription,
             SendMessagesRequest request,
             BrokerService broker,
             CancellationToken cancellationToken) =>
         {
             var sequenceNumbers = await broker.SendAsync(
-                Resolve(name), request.Messages.Select(ToEnvelope).ToList(), cancellationToken);
+                Resolve(name, subscription), request.Messages.Select(ToEnvelope).ToList(), cancellationToken);
 
             return Results.Ok(new { sequenceNumbers });
         });
 
         group.MapPost("/messages/receive", async (
             string name,
+            string? subscription,
             BrokerService broker,
             CancellationToken cancellationToken,
             int maxMessages = 1,
@@ -82,7 +98,7 @@ public static class DataEndpoints
             string? receiverId = null) =>
         {
             var messages = await broker.ReceiveAsync(
-                Resolve(name),
+                Resolve(name, subscription),
                 maxMessages,
                 string.Equals(mode, "receiveanddelete", StringComparison.OrdinalIgnoreCase)
                     ? ReceiveMode.ReceiveAndDelete
@@ -96,12 +112,14 @@ public static class DataEndpoints
 
         group.MapPost("/messages/peek", async (
             string name,
+            string? subscription,
             BrokerService broker,
             CancellationToken cancellationToken,
             ulong fromSequenceNumber = 0,
             int maxMessages = 10) =>
         {
-            var messages = await broker.PeekAsync(Resolve(name), fromSequenceNumber, maxMessages, cancellationToken);
+            var messages = await broker.PeekAsync(
+                Resolve(name, subscription), fromSequenceNumber, maxMessages, cancellationToken);
             return Results.Ok(messages.Select(ToDto));
         });
 
@@ -116,12 +134,13 @@ public static class DataEndpoints
             var settleAction = action;
             group.MapPost($"/messages/{segment}", async (
                 string name,
+                string? subscription,
                 SettleRequestDto request,
                 BrokerService broker,
                 CancellationToken cancellationToken) =>
             {
                 var results = await broker.SettleAsync(
-                    Resolve(name),
+                    Resolve(name, subscription),
                     settleAction,
                     [
                         new Settlement
@@ -142,12 +161,13 @@ public static class DataEndpoints
 
         group.MapPost("/messages/renewlock", async (
             string name,
+            string? subscription,
             SettleRequestDto request,
             BrokerService broker,
             CancellationToken cancellationToken) =>
         {
             var lockedUntil = await broker.RenewLockAsync(
-                Resolve(name), request.SequenceNumber, request.LockToken, cancellationToken);
+                Resolve(name, subscription), request.SequenceNumber, request.LockToken, cancellationToken);
 
             return Results.Ok(new { lockedUntil });
         });

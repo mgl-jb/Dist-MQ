@@ -15,7 +15,7 @@ suite green and lands its own documentation.
   green against Azurite.
 - [x] **5. Single-node broker: queues** — gRPC data plane, REST admin,
   peek-lock, lock expiry sweeper, TTL, DLQ, recovery from snapshot.
-- [ ] **6. Topics, subscriptions, filters** — per-subscription state, correlation
+- [x] **6. Topics, subscriptions, filters** — per-subscription state, correlation
   and SQL-subset filters, rule actions, rule CRUD.
 - [ ] **7. Scheduled, deferred, dedup, batching** — timer worker, deferral index,
   dedup window and sweeper, batched append/settle, credit-based prefetch.
