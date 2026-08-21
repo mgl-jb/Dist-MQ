@@ -119,6 +119,7 @@ all of them. The in-memory hot path on the owning broker does the rest.
 | [Protocol](docs/protocol.md) | gRPC, REST and WebSocket surfaces, error model, settlement |
 | [Operations](docs/operations.md) | Deployment, configuration, scaling, metrics, troubleshooting |
 | [ADRs](docs/adr/) | Twelve decision records |
+| [Plan](docs/plan.md) | How the work was scoped, verified, and how it turned out |
 | [Roadmap](docs/roadmap.md) | Build order and current state |
 
 ## Repository layout

@@ -1,7 +1,8 @@
 # Roadmap / build record
 
 The implementation order, kept current as steps land. Each step keeps the test
-suite green and lands its own documentation.
+suite green and lands its own documentation. See [the plan](plan.md) for why the
+order is what it is, and how the build turned out against it.
 
 - [x] **1. Scaffold and design docs** — solution, central package management, CI,
   `docs/architecture.md`, `docs/storage-layout.md`, ADRs 0001–0012.

@@ -1,5 +1,8 @@
 # Architecture Decision Records
 
+Decisions 0001, 0010 and 0012 were taken before any code was written; see
+[the plan](../plan.md). The rest were made while building.
+
 | # | Decision |
 |---|---|
 | [0001](0001-azure-storage-only-backend.md) | Azure Storage is the only backend |
